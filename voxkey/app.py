@@ -136,14 +136,20 @@ class Engine(QObject):
         # A modifier latched down by Windows stops the chord matching for as
         # long as it stays stuck, which looks exactly like the app being broken.
         blocked = self.hotkey.blocked_by()
-        self._blocked_for = self._blocked_for + 1 if blocked else 0
+        stuck = self.hotkey.stuck_key()
+        self._blocked_for = self._blocked_for + 1 if (blocked or stuck) else 0
         if self._blocked_for == 2:
-            self.notice.emit(
-                "Hotkey is blocked",
-                f"Windows still reports {blocked.capitalize()} as held down, so the "
-                f"chord cannot match. Tap and release {blocked.capitalize()} to clear it.",
-            )
-            self.ready_changed.emit(f"{blocked.capitalize()} is stuck down")
+            if blocked:
+                detail = (f"Windows still reports {blocked.capitalize()} as held down, so "
+                          f"the chord cannot match. Tap and release {blocked.capitalize()}.")
+                short = f"{blocked.capitalize()} is stuck down"
+            else:
+                detail = (f"A key (virtual code 0x{stuck:02X}) has been reported held for "
+                          "ten seconds, which cancels every dictation. Tap it to clear it.")
+                short = f"Key 0x{stuck:02X} is stuck down"
+            log.warning("hotkey blocked: %s", short)
+            self.notice.emit("Hotkey is blocked", detail)
+            self.ready_changed.emit(short)
         elif self._blocked_for == 0 and self.transcriber.is_loaded():
             self.ready_changed.emit(f"Ready ({self.transcriber.last_device})")
 

@@ -41,6 +41,25 @@ KEY_VKS.update({chr(c): c for c in range(ord("A"), ord("Z") + 1)})
 KEY_VKS.update({str(d): 0x30 + d for d in range(10)})
 KEY_VKS.update({f"f{n}": 0x6F + n for n in range(1, 25)})
 
+# Keys that count as "the user is pressing something else, so this chord is the
+# start of a real shortcut". It has to be an allowlist. Scanning the whole
+# virtual-key range instead swept up media and browser keys, and a keyboard that
+# latches VK_MEDIA_PLAY_PAUSE (0xB3) on permanently then cancelled every single
+# dictation, with nothing to show for it.
+TYPING_VKS: set[int] = set()
+TYPING_VKS |= set(range(0x30, 0x3A))          # 0-9
+TYPING_VKS |= set(range(0x41, 0x5B))          # A-Z
+TYPING_VKS |= set(range(0x60, 0x70))          # numpad digits and operators
+TYPING_VKS |= set(range(0x70, 0x88))          # F1-F24
+TYPING_VKS |= {
+    0x08, 0x09, 0x0D, 0x1B, 0x20,             # backspace, tab, enter, esc, space
+    0x21, 0x22, 0x23, 0x24,                   # page up/down, end, home
+    0x25, 0x26, 0x27, 0x28,                   # arrows
+    0x2C, 0x2D, 0x2E,                         # print screen, insert, delete
+    0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, # ;=,-./`
+    0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE2,       # brackets, backslash, quote, oem
+}
+
 
 def key_label(modifiers: list[str], key: str) -> str:
     parts = [m.capitalize() for m in modifiers]
@@ -153,15 +172,25 @@ class HotkeyListener(threading.Thread):
         return True
 
     def _foreign_key_down(self, chord_vks: set[int], key: str) -> bool:
-        """True if a key outside the chord is held (an ordinary shortcut)."""
-        for vk in range(0x08, 0xFF):
+        """True if a typing key outside the chord is held (an ordinary shortcut).
+
+        Media, volume and browser keys are deliberately not in TYPING_VKS: they
+        are never part of a keyboard shortcut, and some keyboards report one as
+        held forever, which would silently disable the chord.
+        """
+        for vk in TYPING_VKS:
             if vk in chord_vks or vk in _ALL_MODIFIER_VKS:
-                continue
-            if vk in (0x01, 0x02, 0x04, 0x05, 0x06):  # mouse buttons
                 continue
             if _down(vk):
                 return True
         return False
+
+    def stuck_key(self) -> int:
+        """A typing key reported held right now, for the health check."""
+        for vk in TYPING_VKS:
+            if _down(vk):
+                return vk
+        return 0
 
     # -- main loop -------------------------------------------------------
     def run(self) -> None:

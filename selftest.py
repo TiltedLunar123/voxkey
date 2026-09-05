@@ -161,6 +161,30 @@ def main() -> int:
         got = apply_self_corrections(said)
         check(f"discard: {said[:30]!r}", got == want, got)
 
+    print("stuck-key immunity")
+    from voxkey.hotkey import TYPING_VKS
+
+    # A keyboard that latches VK_MEDIA_PLAY_PAUSE on permanently made every
+    # dictation cancel itself, because the "is another key down" check swept the
+    # whole virtual-key range. These must never count as typing keys.
+    NEVER = {
+        0xA6: "browser back", 0xA7: "browser forward", 0xA8: "browser refresh",
+        0xA9: "browser stop", 0xAA: "browser search", 0xAB: "browser favourites",
+        0xAC: "browser home", 0xAD: "volume mute", 0xAE: "volume down",
+        0xAF: "volume up", 0xB0: "media next", 0xB1: "media previous",
+        0xB2: "media stop", 0xB3: "media play/pause", 0xB4: "launch mail",
+        0xB5: "select media", 0xB6: "launch app 1", 0xB7: "launch app 2",
+        0x14: "caps lock", 0x90: "num lock", 0x91: "scroll lock",
+        0xE5: "IME process", 0xE7: "packet",
+    }
+    for vk, label in NEVER.items():
+        check(f"{label} cannot block the chord", vk not in TYPING_VKS, f"0x{vk:02X}")
+
+    MUST = {0x41: "A", 0x30: "0", 0x70: "F1", 0x20: "space", 0x0D: "enter",
+            0x25: "left arrow", 0xBE: "full stop", 0x60: "numpad 0"}
+    for vk, label in MUST.items():
+        check(f"{label} still cancels a dictation", vk in TYPING_VKS, f"0x{vk:02X}")
+
     print("fix chord")
     from voxkey.cleanup.pipeline import _split_paragraphs
 
