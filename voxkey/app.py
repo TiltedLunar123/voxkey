@@ -91,8 +91,14 @@ class Engine(QObject):
         self._meter = QTimer(self)
         self._meter.timeout.connect(self._pump_meter)
 
-        self.hotkey = HotkeyListener(
-            config,
+        self.hotkey = self._new_listener()
+        self._blocked_for = 0
+        self._watchdog = QTimer(self)
+        self._watchdog.timeout.connect(self._check_health)
+
+    def _new_listener(self) -> HotkeyListener:
+        return HotkeyListener(
+            self.config,
             on_start=self._start_requested.emit,
             on_stop=self._stop_requested.emit,
             on_cancel=self._cancel_requested.emit,
@@ -100,9 +106,51 @@ class Engine(QObject):
             on_fix=self._fix_requested.emit,
         )
 
+    def _check_health(self) -> None:
+        """The chord going quiet must never be a silent failure."""
+        if not self.hotkey.is_alive():
+            log.error("the hotkey listener is not running, starting a new one")
+            self.hotkey = self._new_listener()
+            self.hotkey.start()
+            self.notice.emit(
+                "Hotkey restarted", "The key listener had stopped. It is running again."
+            )
+            return
+        # The microphone is held open for the pre-roll buffer, and a stream that
+        # dies quietly turns every dictation into "Nothing heard".
+        if self.config.get("audio.preroll", True) and self.recorder.is_stalled():
+            log.error("the microphone stream stalled, reopening it")
+            device = self.config.get("audio.device")
+            self.recorder.close_monitor()
+            if self.recorder.open_monitor(device):
+                self.notice.emit(
+                    "Microphone reconnected",
+                    "The audio stream had stopped delivering. It is running again.",
+                )
+            else:
+                self.notice.emit(
+                    "Microphone unavailable", self.recorder.error or "the device went away"
+                )
+            return
+
+        # A modifier latched down by Windows stops the chord matching for as
+        # long as it stays stuck, which looks exactly like the app being broken.
+        blocked = self.hotkey.blocked_by()
+        self._blocked_for = self._blocked_for + 1 if blocked else 0
+        if self._blocked_for == 2:
+            self.notice.emit(
+                "Hotkey is blocked",
+                f"Windows still reports {blocked.capitalize()} as held down, so the "
+                f"chord cannot match. Tap and release {blocked.capitalize()} to clear it.",
+            )
+            self.ready_changed.emit(f"{blocked.capitalize()} is stuck down")
+        elif self._blocked_for == 0 and self.transcriber.is_loaded():
+            self.ready_changed.emit(f"Ready ({self.transcriber.last_device})")
+
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
         self.hotkey.start()
+        self._watchdog.start(5000)
         self.overlay.refresh_visibility()
         if self.config.get("audio.preroll", True):
             # Hold the microphone open so the ring buffer already contains the
@@ -127,6 +175,7 @@ class Engine(QObject):
             self.pipeline.warm()
 
     def shutdown(self) -> None:
+        self._watchdog.stop()
         self.hotkey.stop()
         self.recorder.close_monitor()
         self.overlay.dismiss()
@@ -251,7 +300,15 @@ class Engine(QObject):
         clip = self.recorder.stop()
         elapsed = len(clip) / audio_mod.SAMPLE_RATE
         minimum = float(self.config.get("audio.min_duration_ms", 350)) / 1000.0
-        if elapsed < minimum or audio_mod.is_silent(clip):
+        silent = audio_mod.is_silent(clip)
+        if elapsed < minimum or silent:
+            # Logged, because a run of these is what "the hotkey stopped
+            # working" actually looks like from the outside.
+            log.info(
+                "discarded a take: %.2fs, peak %.4f, %s",
+                elapsed, self.recorder.peak,
+                "silent" if silent else "shorter than the minimum",
+            )
             self.overlay.finish("cancelled", "Nothing heard", 800)
             self.state_changed.emit("idle", "")
             return

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import io
+import logging
 import struct
 import threading
+import time
 import wave
 from collections import deque
 import winsound
 
 import numpy as np
 import sounddevice as sd
+
+log = logging.getLogger("voxkey.audio")
 
 PREROLL_S = 0.6   # audio kept from before the key went down
 SAMPLE_RATE = 16000  # what Whisper expects; resampling anywhere else is waste
@@ -49,6 +53,7 @@ class Recorder:
         self._level = 0.0
         self._peak = 0.0
         self._device: int | None = None
+        self._last_block = 0.0
         self.error: str | None = None
         self.set_preroll(PREROLL_S)
 
@@ -80,6 +85,9 @@ class Recorder:
             return sum(len(b) for b in self._blocks) / SAMPLE_RATE
 
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
+        self._last_block = time.monotonic()
+        if status:
+            log.debug("input stream status: %s", status)
         block = indata[:, 0].copy()
         with self._lock:
             self._ring.append(block)
@@ -109,11 +117,24 @@ class Recorder:
             )
             self._stream.start()
             self._device = device
+            self._last_block = time.monotonic()
             return True
         except Exception as exc:
             self.error = str(exc)
             self._stream = None
             return False
+
+    def is_stalled(self, timeout: float = 1.5) -> bool:
+        """Open, but no audio has arrived for a while.
+
+        A held-open input stream does not raise when the device is taken away,
+        put to sleep, or grabbed exclusively by something else. The callback
+        simply stops. Every take after that is silence, and the app looks like
+        the hotkey has died when it is really the microphone.
+        """
+        if self._stream is None:
+            return False
+        return (time.monotonic() - self._last_block) > timeout
 
     def close_monitor(self) -> None:
         stream, self._stream = self._stream, None

@@ -9,9 +9,12 @@ reaching the foreground window.
 from __future__ import annotations
 
 import ctypes
+import logging
 import threading
 import time
 from typing import Callable
+
+log = logging.getLogger("voxkey.hotkey")
 
 _user32 = ctypes.windll.user32
 
@@ -164,51 +167,75 @@ class HotkeyListener(threading.Thread):
     def run(self) -> None:
         held_since: float | None = None
         while not self._stop_event.is_set():
-            time.sleep(self.POLL_S)
-            if self._paused.is_set():
+            try:
+                held_since = self._poll(held_since)
+            except Exception:
+                # One bad iteration must never kill the thread. A dead listener
+                # is indistinguishable from a dead app from the outside: the
+                # chord simply stops working and nothing says why.
+                log.exception("hotkey poll failed, continuing")
+                time.sleep(0.25)
+
+    def blocked_by(self) -> str:
+        """A modifier that is held but is not part of the binding, if any.
+
+        Windows can leave a modifier latched down after a focus change or an
+        RDP session. The chord then never matches and the feature looks broken,
+        so this is surfaced rather than worked around.
+        """
+        modifiers, key, _mode, _threshold, _cancel = self._binding()
+        for name, vks in MODIFIER_VKS.items():
+            if name not in modifiers and _any_down(vks):
+                return name
+        return ""
+
+    def _poll(self, held_since: float | None) -> float | None:
+        time.sleep(self.POLL_S)
+        if self._paused.is_set():
+            if self._active or self._armed:
+                self._active = self._armed = False
+                self.on_cancel()
+            held_since = None
+            return held_since
+
+        # The fix chord is a superset of the talk chord, so it has to be
+        # tested first or the talk chord would see a stray release.
+        fix_modifiers, fix_key, fix_on = self._fix_binding()
+        if fix_on and self._chord_held(fix_modifiers, fix_key):
+            if not self._fix_fired:
+                self._fix_fired = True
                 if self._active or self._armed:
                     self._active = self._armed = False
                     self.on_cancel()
+                self.on_fix()
+            held_since = None
+            return held_since
+        self._fix_fired = False
+
+        modifiers, key, mode, threshold, cancel_on_other = self._binding()
+        chord_vks = self._chord_vks(modifiers, key)
+        held = self._chord_held(modifiers, key)
+
+        if self._suppress_until_release:
+            if not held:
+                self._suppress_until_release = False
                 held_since = None
-                continue
+            return held_since
 
-            # The fix chord is a superset of the talk chord, so it has to be
-            # tested first or the talk chord would see a stray release.
-            fix_modifiers, fix_key, fix_on = self._fix_binding()
-            if fix_on and self._chord_held(fix_modifiers, fix_key):
-                if not self._fix_fired:
-                    self._fix_fired = True
-                    if self._active or self._armed:
-                        self._active = self._armed = False
-                        self.on_cancel()
-                    self.on_fix()
-                held_since = None
-                continue
-            self._fix_fired = False
+        if held and cancel_on_other and self._foreign_key_down(chord_vks, key):
+            # The chord is a prefix for a real shortcut; back off entirely.
+            if self._active or self._armed:
+                self._active = self._armed = False
+                self.on_cancel()
+            self._suppress_until_release = True
+            held_since = None
+            return held_since
 
-            modifiers, key, mode, threshold, cancel_on_other = self._binding()
-            chord_vks = self._chord_vks(modifiers, key)
-            held = self._chord_held(modifiers, key)
-
-            if self._suppress_until_release:
-                if not held:
-                    self._suppress_until_release = False
-                    held_since = None
-                continue
-
-            if held and cancel_on_other and self._foreign_key_down(chord_vks, key):
-                # The chord is a prefix for a real shortcut; back off entirely.
-                if self._active or self._armed:
-                    self._active = self._armed = False
-                    self.on_cancel()
-                self._suppress_until_release = True
-                held_since = None
-                continue
-
-            if mode == "toggle":
-                self._tick_toggle(held, threshold)
-            else:
-                held_since = self._tick_hold(held, threshold, held_since)
+        if mode == "toggle":
+            self._tick_toggle(held, threshold)
+        else:
+            held_since = self._tick_hold(held, threshold, held_since)
+        return held_since
 
     def _tick_hold(self, held: bool, threshold: float, held_since: float | None):
         now = time.monotonic()
