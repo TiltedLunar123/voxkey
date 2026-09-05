@@ -89,7 +89,14 @@ def main() -> int:
     check("drops fillers", " um " not in cleaned and " uh " not in cleaned, cleaned[:60])
     check("folds stutters", " we we " not in cleaned and "the the" not in cleaned)
     check("obeys spoken new line", "\n" in cleaned)
-    check("applies replacements", "Security+" in cleaned)
+    # Self-contained: the shipped defaults must not decide whether this passes,
+    # or the suite fails for anyone whose own replacement list differs.
+    saved_rules = config.get("cleanup.replacements")
+    config.set("cleanup.replacements", [
+        {"from": "sec plus", "to": "Security+", "regex": False, "case_sensitive": False},
+    ])
+    check("applies replacements", "Security+" in pipeline.process(DICTATED, "clean").text)
+    config.set("cleanup.replacements", saved_rules)
     check("no em dashes", "—" not in cleaned and "–" not in cleaned)
 
     minimal = pipeline.process(DICTATED, "minimal").text
