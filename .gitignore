@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# scratch from development
+_shots/
+_chunk.py
+*.mp3
+*.wav

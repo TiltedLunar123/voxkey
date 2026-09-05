@@ -1,0 +1,11 @@
+faster-whisper>=1.2.1
+sounddevice>=0.4.6
+numpy>=1.26
+PySide6>=6.6
+requests>=2.31
+
+# CUDA runtime for the GPU path. ctranslate2 loads cublas64_12.dll and cudnn
+# by name, and the pip wheels are the only copies on a machine without the
+# full CUDA toolkit. Skip these two for a CPU-only install.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12>=9,<10

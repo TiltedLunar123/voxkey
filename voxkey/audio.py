@@ -1,0 +1,213 @@
+"""Microphone capture and the two feedback blips."""
+
+from __future__ import annotations
+
+import io
+import struct
+import threading
+import wave
+from collections import deque
+import winsound
+
+import numpy as np
+import sounddevice as sd
+
+PREROLL_S = 0.6   # audio kept from before the key went down
+SAMPLE_RATE = 16000  # what Whisper expects; resampling anywhere else is waste
+BLOCK = 1024
+
+
+def list_input_devices() -> list[tuple[int | None, str]]:
+    """(index, label) for every device that can record, default first."""
+    devices: list[tuple[int | None, str]] = [(None, "System default")]
+    try:
+        for index, info in enumerate(sd.query_devices()):
+            if info.get("max_input_channels", 0) > 0:
+                api = sd.query_hostapis(info["hostapi"])["name"]
+                devices.append((index, f"{info['name']}  ({api})"))
+    except Exception:
+        pass
+    return devices
+
+
+class Recorder:
+    """Capture with a rolling pre-roll buffer.
+
+    The stream is held open and every block goes into a short ring buffer. When
+    a dictation begins, that ring is prepended, so speech from *before* the key
+    went down is still captured. Without it the hold threshold plus the roughly
+    100ms the audio stream needs to start swallows the first word, which is what
+    turned "Hey, can you..." into "Emge."
+    """
+
+    def __init__(self) -> None:
+        self._stream: sd.InputStream | None = None
+        self._blocks: list[np.ndarray] = []
+        self._ring: deque[np.ndarray] = deque(maxlen=1)
+        self._lock = threading.Lock()
+        self._capturing = False
+        self._level = 0.0
+        self._peak = 0.0
+        self._device: int | None = None
+        self.error: str | None = None
+        self.set_preroll(PREROLL_S)
+
+    def set_preroll(self, seconds: float) -> None:
+        blocks = max(1, int(seconds * SAMPLE_RATE / BLOCK))
+        with self._lock:
+            self._ring = deque(self._ring, maxlen=blocks)
+
+    @property
+    def monitoring(self) -> bool:
+        return self._stream is not None
+
+    @property
+    def recording(self) -> bool:
+        return self._capturing
+
+    @property
+    def level(self) -> float:
+        """0..1 RMS of the most recent block, for the meter."""
+        return self._level
+
+    @property
+    def peak(self) -> float:
+        return self._peak
+
+    @property
+    def duration_s(self) -> float:
+        with self._lock:
+            return sum(len(b) for b in self._blocks) / SAMPLE_RATE
+
+    def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
+        block = indata[:, 0].copy()
+        with self._lock:
+            self._ring.append(block)
+            if self._capturing:
+                self._blocks.append(block)
+        rms = float(np.sqrt(np.mean(np.square(block)))) if frames else 0.0
+        # Perceptual-ish curve so quiet speech still moves the meter.
+        self._level = min(1.0, rms * 12.0)
+        if self._capturing and frames:
+            self._peak = max(self._peak, float(np.max(np.abs(block))))
+
+    # -- stream lifecycle -------------------------------------------------
+    def open_monitor(self, device: int | None = None) -> bool:
+        """Hold the input stream open so the ring buffer is always warm."""
+        if self._stream is not None and device == self._device:
+            return True
+        self.close_monitor()
+        self.error = None
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=BLOCK,
+                device=device,
+                callback=self._callback,
+            )
+            self._stream.start()
+            self._device = device
+            return True
+        except Exception as exc:
+            self.error = str(exc)
+            self._stream = None
+            return False
+
+    def close_monitor(self) -> None:
+        stream, self._stream = self._stream, None
+        self._capturing = False
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        with self._lock:
+            self._ring.clear()
+            self._blocks = []
+
+    # -- one dictation ----------------------------------------------------
+    def start(self, device: int | None = None) -> bool:
+        """Begin a take, keeping whatever is already in the ring buffer."""
+        if not self.open_monitor(device):
+            return False
+        self._peak = 0.0
+        with self._lock:
+            # Everything heard in the last moment becomes the head of the take.
+            self._blocks = list(self._ring)
+            self._capturing = True
+        return True
+
+    def stop(self) -> np.ndarray:
+        with self._lock:
+            self._capturing = False
+            blocks, self._blocks = self._blocks, []
+        if not blocks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(blocks).astype(np.float32)
+
+    def discard(self) -> None:
+        with self._lock:
+            self._capturing = False
+            self._blocks = []
+
+
+SILENCE_PEAK = 0.012   # below this a clip is room tone, not speech
+
+
+def is_silent(audio: np.ndarray) -> bool:
+    if audio.size == 0:
+        return True
+    return float(np.max(np.abs(audio))) < SILENCE_PEAK
+
+
+def normalise(audio: np.ndarray, gain: float = 1.0, target_peak: float = 0.85) -> np.ndarray:
+    """Apply user gain, then lift quiet takes without clipping loud ones."""
+    if audio.size == 0:
+        return audio
+    audio = audio * float(gain)
+    peak = float(np.max(np.abs(audio)))
+    # Amplifying near-silence by 8x just makes loud room tone, and Whisper
+    # answers loud room tone with "Thank you." Leave it quiet instead.
+    if SILENCE_PEAK <= peak < target_peak:
+        audio = audio * min(target_peak / peak, 8.0)
+    return np.clip(audio, -1.0, 1.0)
+
+
+def _tone_wav(freq: float, ms: int, volume: float = 0.25) -> bytes:
+    rate = 22050
+    n = int(rate * ms / 1000)
+    t = np.arange(n) / rate
+    # Short fades stop the click you get from starting a sine at full amplitude.
+    fade = max(1, n // 8)
+    env = np.ones(n)
+    env[:fade] = np.linspace(0, 1, fade)
+    env[-fade:] = np.linspace(1, 0, fade)
+    samples = (np.sin(2 * np.pi * freq * t) * env * volume * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(struct.pack(f"<{n}h", *samples))
+    return buf.getvalue()
+
+
+_TONES = {
+    "start": _tone_wav(880, 70),
+    "stop": _tone_wav(587, 70),
+    "error": _tone_wav(220, 160),
+}
+
+
+def blip(kind: str) -> None:
+    """Fire and forget; a failed beep must never break a dictation."""
+    data = _TONES.get(kind)
+    if not data:
+        return
+    try:
+        winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+    except Exception:
+        pass
