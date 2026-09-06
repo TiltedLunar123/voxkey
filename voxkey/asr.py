@@ -23,7 +23,6 @@ MODELS: list[tuple[str, str, str]] = [
     ("large-v3-turbo - recommended", "large-v3-turbo", "1.6 GB"),
     ("large-v3 - most accurate, slowest", "large-v3", "3.1 GB"),
 ]
-MODEL_IDS = [m[1] for m in MODELS]
 
 LANGUAGES = [
     ("Auto detect", ""), ("English", "en"), ("Spanish", "es"), ("French", "fr"),

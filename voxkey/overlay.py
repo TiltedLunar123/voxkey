@@ -49,14 +49,16 @@ STATES = {
     "cancelled": ("Cancelled", QColor(148, 163, 184)),
 }
 
-# Kept for the settings dropdown; the bar is dragged rather than picked now.
 POSITIONS = [
+    ("Bottom right", "bottom-right"),
     ("Bottom centre", "bottom-center"),
     ("Bottom left", "bottom-left"),
-    ("Bottom right", "bottom-right"),
-    ("Left edge", "left"),
-    ("Right edge", "right"),
+    ("Top right", "top-right"),
+    ("Top centre", "top-center"),
+    ("Top left", "top-left"),
+    ("Where I dragged it", "custom"),
 ]
+MARGIN = 22
 
 
 class Overlay(QWidget):
@@ -159,18 +161,41 @@ class Overlay(QWidget):
         self._grow.setEndValue(target)
         self._grow.start()
 
+    def _preset_point(self, preset: str) -> QPoint:
+        """Top-left corner for a named corner or edge of the current screen."""
+        area = self._screen().availableGeometry()
+        vertical, _, horizontal = preset.partition("-")
+        y = area.top() + MARGIN if vertical == "top" else area.bottom() - self.height() - MARGIN
+        if horizontal == "left":
+            x = area.left() + MARGIN
+        elif horizontal == "center":
+            x = area.center().x() - self.width() // 2
+        else:
+            x = area.right() - self.width() - MARGIN
+        return QPoint(x, y)
+
     def restore_position(self) -> None:
         area = self._screen().availableGeometry()
+        preset = self.config.get("ui.bar_position", "bottom-right")
+        if preset != "custom":
+            self.move(self._preset_point(preset))
+            return
         saved_x = self.config.get("ui.bar_x", -1)
         saved_y = self.config.get("ui.bar_y", -1)
-        if saved_x >= 0 and saved_y >= 0:
-            x = min(max(area.left() + 6, int(saved_x)), area.right() - self.width() - 6)
-            y = min(max(area.top() + 6, int(saved_y)), area.bottom() - self.height() - 6)
-            self.move(x, y)
+        if saved_x < 0 or saved_y < 0:
+            self.move(self._preset_point("bottom-right"))
             return
-        # Bottom right by default: a bottom-centre bar sits exactly where chat
-        # and search boxes live and covers the thing you are dictating into.
-        self.move(area.right() - self.width() - 22, area.bottom() - self.height() - 22)
+        # Clamp, so a position saved on a monitor that is now unplugged does not
+        # park the bar somewhere invisible.
+        x = min(max(area.left() + 6, int(saved_x)), area.right() - self.width() - 6)
+        y = min(max(area.top() + 6, int(saved_y)), area.bottom() - self.height() - 6)
+        self.move(x, y)
+
+    def move_to_preset(self, preset: str) -> None:
+        self.config.set("ui.bar_position", preset)
+        self.config.save()
+        if preset != "custom":
+            self.move(self._preset_point(preset))
 
     def _snap_to_edge(self) -> None:
         """Drop onto the nearest edge, the way the Flow Bar snaps."""
@@ -196,6 +221,8 @@ class Overlay(QWidget):
         x = min(max(area.left() + 6, x), area.right() - self.width() - 6)
         y = min(max(area.top() + 6, y), area.bottom() - self.height() - 6)
         self.move(x, y)
+        # Dragging it means you want it there, not on a preset.
+        self.config.set("ui.bar_position", "custom")
         self.config.set("ui.bar_x", x)
         self.config.set("ui.bar_y", y)
         self.config.save()
@@ -596,6 +623,14 @@ class Overlay(QWidget):
         menu.addAction("Settings...", self.settings_requested.emit)
         menu.addAction("History...", self.history_requested.emit)
         menu.addAction("Paste last transcript", self.paste_last_requested.emit)
+        place = menu.addMenu("Move to")
+        current = self.config.get("ui.bar_position", "bottom-right")
+        for label, key in POSITIONS:
+            if key == "custom":
+                continue
+            action = place.addAction(label, lambda k=key: self.move_to_preset(k))
+            action.setCheckable(True)
+            action.setChecked(key == current)
         menu.addSeparator()
         menu.addAction("Hide for 1 hour", lambda: self.snooze(3600))
         always = menu.addAction("Always show the bar")

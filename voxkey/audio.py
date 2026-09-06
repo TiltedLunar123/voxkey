@@ -63,10 +63,6 @@ class Recorder:
             self._ring = deque(self._ring, maxlen=blocks)
 
     @property
-    def monitoring(self) -> bool:
-        return self._stream is not None
-
-    @property
     def recording(self) -> bool:
         return self._capturing
 
@@ -78,11 +74,6 @@ class Recorder:
     @property
     def peak(self) -> float:
         return self._peak
-
-    @property
-    def duration_s(self) -> float:
-        with self._lock:
-            return sum(len(b) for b in self._blocks) / SAMPLE_RATE
 
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         self._last_block = time.monotonic()

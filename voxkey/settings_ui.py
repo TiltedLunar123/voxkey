@@ -22,6 +22,7 @@ from . import asr as asr_mod
 from . import audio as audio_mod
 from .config import CONFIG_DIR, LOG_PATH, PROFILES
 from .hotkey import KEY_VKS, key_label
+from .overlay import POSITIONS
 
 STYLE = """
 QWidget { background: #12151c; color: #e6ebf5; font-family: 'Segoe UI'; font-size: 13px; }
@@ -69,6 +70,13 @@ QScrollArea { border: none; }
 """
 
 MODIFIERS = [("Ctrl", "ctrl"), ("Alt", "alt"), ("Shift", "shift"), ("Win", "win")]
+
+_DIAG_LABELS = {
+    "listener": "Key listener", "chord": "Talk chord", "blocked": "Blocked by",
+    "device": "Input device", "stream": "Audio stream", "level": "Live level",
+    "speech": "State", "speech_device": "Model", "ollama": "Ollama",
+    "llm_model": "Model", "last": "Most recent",
+}
 
 
 def hint(text: str) -> QLabel:
@@ -127,6 +135,7 @@ class SettingsWindow(QMainWindow):
         self.tabs.addTab(scrollable(self._tab_output()), "Output")
         self.tabs.addTab(self._tab_history(), "History")
         self.tabs.addTab(scrollable(self._tab_advanced()), "Advanced")
+        self.tabs.addTab(scrollable(self._tab_diagnostics()), "Diagnostics")
 
         # The tabs are built first because the simple page mirrors their widgets.
         back = QWidget()
@@ -1187,12 +1196,14 @@ class SettingsWindow(QMainWindow):
             "Drag the bar anywhere; it snaps to the nearest edge and stays there. "
             "Right-click it for the menu, or to hide it for an hour."
         ))
-        reset_row = QHBoxLayout()
-        reset_bar = QPushButton("Reset bar position")
-        reset_bar.clicked.connect(self._reset_bar_position)
-        reset_row.addWidget(reset_bar)
-        reset_row.addStretch(1)
-        feedback_layout.addLayout(reset_row)
+        place_row = QHBoxLayout()
+        place_row.addWidget(QLabel("Position"))
+        self._advanced_place = self.combo("ui.bar_position", POSITIONS)
+        self._advanced_place.currentIndexChanged.connect(
+            lambda: self.engine.overlay.move_to_preset(self._advanced_place.currentData())
+        )
+        place_row.addWidget(self._advanced_place, 1)
+        feedback_layout.addLayout(place_row)
         feedback_layout.addWidget(self.check("Play a blip when recording starts and stops", "ui.sounds"))
         feedback_layout.addWidget(self.check("Show a notification when something fails", "ui.notify_errors"))
         layout.addWidget(feedback)
@@ -1236,14 +1247,6 @@ class SettingsWindow(QMainWindow):
             self._startup_check.blockSignals(True)
             self._startup_check.setChecked(startup.is_enabled())
             self._startup_check.blockSignals(False)
-
-    def _reset_bar_position(self) -> None:
-        self.config.set("ui.bar_x", -1)
-        self.config.set("ui.bar_y", -1)
-        self.config.save()
-        self.engine.overlay.restore_position()
-        self.engine.overlay.refresh_visibility()
-        self.status.showMessage("Flow Bar moved back to the bottom centre", 3000)
 
     def _open_log(self) -> None:
         if LOG_PATH.exists():
@@ -1346,6 +1349,20 @@ class SettingsWindow(QMainWindow):
         self._simple_level.setFixedHeight(10)
         layout.addWidget(self._simple_level)
 
+        layout.addSpacing(6)
+        place_row = QHBoxLayout()
+        place_row.addWidget(QLabel("Bar sits"))
+        self._simple_place = QComboBox()
+        for label, key in POSITIONS:
+            self._simple_place.addItem(label, key)
+        found = self._simple_place.findData(self.config.get("ui.bar_position", "bottom-right"))
+        self._simple_place.setCurrentIndex(max(0, found))
+        self._simple_place.currentIndexChanged.connect(
+            lambda: self.engine.overlay.move_to_preset(self._simple_place.currentData())
+        )
+        place_row.addWidget(self._simple_place, 1)
+        layout.addLayout(place_row)
+
         layout.addSpacing(4)
         self._simple_startup = QCheckBox("Start VoxKey when Windows starts")
         from . import startup
@@ -1403,14 +1420,6 @@ class SettingsWindow(QMainWindow):
         combo.blockSignals(True)
         combo.setCurrentIndex(max(0, combo.findData(key)))
         combo.blockSignals(False)
-
-    def _sync_pair(self, path: str, source: QComboBox, mirror: QComboBox) -> None:
-        value = source.currentData()
-        self._write(path, value)
-        mirror.blockSignals(True)
-        found = mirror.findData(value)
-        mirror.setCurrentIndex(found if found >= 0 else 0)
-        mirror.blockSignals(False)
 
     def _refresh_simple_labels(self) -> None:
         modifiers = [v for v, b in self._simple_mods.items() if b.isChecked()]
@@ -1770,3 +1779,144 @@ class SettingsWindow(QMainWindow):
         self._fix_warning.setText(message)
         self._fix_warning.setStyleSheet("color:#f0b360;" if message else "")
         self._fix_warning.setVisible(bool(message))
+
+    # -- Diagnostics ------------------------------------------------------
+    def _tab_diagnostics(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.addWidget(head("Is it actually working?"))
+        layout.addWidget(hint(
+            "Every part that can fail quietly, reported live. A dictation that "
+            "produces nothing is usually the microphone or a stuck key rather than "
+            "the chord, and those look identical from the outside."
+        ))
+
+        self._diag_rows: dict[str, QLabel] = {}
+        for section, keys in (
+            ("Hotkey", ["listener", "chord", "blocked"]),
+            ("Microphone", ["device", "stream", "level"]),
+            ("Speech model", ["speech", "speech_device"]),
+            ("Rewriter", ["ollama", "llm_model"]),
+            ("Last dictation", ["last"]),
+        ):
+            box = QGroupBox(section)
+            form = QFormLayout(box)
+            for key in keys:
+                value = QLabel("...")
+                value.setWordWrap(True)
+                self._diag_rows[key] = value
+                form.addRow(_DIAG_LABELS[key], value)
+            layout.addWidget(box)
+
+        row = QHBoxLayout()
+        copy = QPushButton("Copy report")
+        copy.setObjectName("primary")
+        copy.clicked.connect(self._copy_diagnostics)
+        row.addWidget(copy)
+        open_log = QPushButton("Open log")
+        open_log.clicked.connect(self._open_log)
+        row.addWidget(open_log)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(1)
+
+        # Only ticks while this tab is on screen; no point polling otherwise.
+        self._diag_timer = QTimer(self)
+        self._diag_timer.timeout.connect(self._refresh_diagnostics)
+        self.tabs.currentChanged.connect(self._diag_tab_changed)
+        return page
+
+    def _diag_tab_changed(self, index: int) -> None:
+        showing = self.tabs.tabText(index) == "Diagnostics"
+        if showing:
+            self._refresh_diagnostics()
+            self._diag_timer.start(700)
+        else:
+            self._diag_timer.stop()
+
+    def _diagnostics(self) -> dict[str, str]:
+        engine = self.engine
+        recorder, transcriber = engine.recorder, engine.transcriber
+        hotkey = engine.hotkey
+
+        blocked_modifier = hotkey.blocked_by()
+        stuck = hotkey.stuck_key()
+        if blocked_modifier:
+            blocked = f"{blocked_modifier.capitalize()} is held down, so the chord cannot match"
+        elif stuck:
+            blocked = f"a key (0x{stuck:02X}) is held down, so every dictation cancels"
+        else:
+            blocked = "nothing in the way"
+
+        device = self.config.get("audio.device")
+        device_name = "System default"
+        if device is not None:
+            for index, label in audio_mod.list_input_devices():
+                if index == device:
+                    device_name = label
+                    break
+
+        if not self.config.get("audio.preroll", True):
+            stream = "opened only while dictating"
+        elif recorder.is_stalled():
+            stream = "STALLED, no audio has arrived recently"
+        else:
+            stream = "open and delivering"
+
+        client = engine.pipeline.llm
+        if not self.config.get("llm.enabled", True):
+            ollama = "switched off, tone profiles fall back to rules"
+        elif client.reachable(timeout=0.8):
+            ollama = f"reachable at {client.base_url}"
+        else:
+            ollama = f"NOT reachable at {client.base_url}"
+
+        model_name = self.config.get("llm.model", "")
+        lowered = model_name.lower()
+        if lowered.startswith("qwen3:") and "instruct" not in lowered:
+            model_name += "   (a reasoning build, expect 30s rewrites)"
+
+        entries = engine.history.entries
+        if entries:
+            newest = entries[0]
+            label = PROFILES.get(newest.profile, {}).get("label", newest.profile)
+            last = f"{newest.day} {newest.when}, {label}, {newest.seconds:.1f}s of audio"
+        else:
+            last = "nothing yet"
+
+        return {
+            "listener": "running" if hotkey.is_alive() else "NOT RUNNING",
+            "chord": key_label(
+                self.config.get("hotkey.modifiers", []), self.config.get("hotkey.key", "")
+            ),
+            "blocked": blocked,
+            "device": device_name,
+            "stream": stream,
+            "level": f"{recorder.level:.3f}   (speak and this should move)",
+            "speech": transcriber.last_error or (
+                "loaded" if transcriber.is_loaded() else "not loaded yet"
+            ),
+            "speech_device": f"{self.config.get('asr.model')} on {transcriber.last_device}",
+            "ollama": ollama,
+            "llm_model": model_name,
+            "last": last,
+        }
+
+    def _refresh_diagnostics(self) -> None:
+        for key, value in self._diagnostics().items():
+            row = self._diag_rows.get(key)
+            if row is None:
+                continue
+            row.setText(value)
+            bad = value.startswith(("NOT", "STALLED")) or "is held down" in value
+            row.setStyleSheet("color:#f87171;" if bad else "")
+
+    def _copy_diagnostics(self) -> None:
+        from . import inject
+        from . import __version__
+
+        lines = [f"VoxKey {__version__}"]
+        lines += [f"{_DIAG_LABELS[k]}: {v}" for k, v in self._diagnostics().items()]
+        inject.set_clipboard_text("\n".join(lines))
+        self.status.showMessage("Report copied to the clipboard", 3000)
