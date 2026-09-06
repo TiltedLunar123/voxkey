@@ -161,6 +161,137 @@ def main() -> int:
         got = apply_self_corrections(said)
         check(f"discard: {said[:30]!r}", got == want, got)
 
+    print("input device resolution")
+    from voxkey.audio import resolve_device as _resolve
+    import sounddevice as _sd
+
+    _devices = _sd.query_devices()
+    _outputs = [i for i, d in enumerate(_devices) if d.get("max_input_channels", 0) == 0]
+    _inputs = [i for i, d in enumerate(_devices) if d.get("max_input_channels", 0) > 0]
+
+    saved_index = config.get("audio.device")
+    saved_name = config.get("audio.device_name")
+    try:
+        # PortAudio renumbers devices when hardware changes. A saved index here
+        # had drifted onto an HDMI output with zero input channels, and every
+        # dictation came back silent with "Invalid number of channels".
+        if _outputs:
+            config.set("audio.device", _outputs[0])
+            config.set("audio.device_name", "")
+            check("an output-only index falls back to the default",
+                  _resolve(config) is None, str(_resolve(config)))
+        config.set("audio.device", 9999)
+        check("an index past the end falls back", _resolve(config) is None)
+        config.set("audio.device", None)
+        check("no device means the system default", _resolve(config) is None)
+        if _inputs:
+            config.set("audio.device", _inputs[0])
+            check("a real input index is kept", _resolve(config) == _inputs[0])
+            # The name wins, because it is the part that survives a reshuffle.
+            config.set("audio.device", _outputs[0] if _outputs else 9999)
+            config.set("audio.device_name", _devices[_inputs[0]]["name"])
+            check("the saved name outranks a stale index",
+                  _resolve(config) == _inputs[0], str(_resolve(config)))
+    finally:
+        config.set("audio.device", saved_index)
+        config.set("audio.device_name", saved_name)
+
+    print("microphone recovery")
+    from voxkey import audio as _a2
+
+    probe = _a2.Recorder()
+    check("a closed stream is not open", not probe.is_open)
+    # The gap this closes: a stream that never opened is not "stalled", so a
+    # watchdog checking only for stalls skipped it and every take stayed silent.
+    check("a never-opened stream is not reported as stalled", not probe.is_stalled())
+    if probe.open_monitor(None):
+        check("opens the default device", probe.is_open)
+        probe.close_monitor()
+        check("closing marks it not open", not probe.is_open)
+    else:
+        print("  SKIP  no input device available to open")
+
+    print("microphone channel fallback")
+    import numpy as _np
+    from voxkey import audio as _audio
+
+    class _MonoRefusingStream:
+        """Plenty of interfaces expose no mono mode; every input device on the
+        machine this was built on reports two or four channels."""
+
+        def __init__(self, **kwargs):
+            if kwargs["channels"] == 1:
+                raise RuntimeError("Invalid number of channels [PaErrorCode -9998]")
+
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    real_stream = _audio.sd.InputStream
+    _audio.sd.InputStream = _MonoRefusingStream
+    try:
+        recorder = _audio.Recorder()
+        check("tries mono first", recorder._channel_options(None)[0] == 1,
+              str(recorder._channel_options(None)))
+        check("opens anyway when mono is refused", recorder.open_monitor(None))
+        check("falls back past mono", recorder._channels > 1, str(recorder._channels))
+        recorder._capturing = True
+        stereo = _np.stack([_np.full(64, 0.4, dtype="float32"),
+                            _np.full(64, 0.8, dtype="float32")], axis=1)
+        recorder._callback(stereo, 64, None, None)
+        mono = recorder.stop()
+        check("mixes down to mono", mono.ndim == 1 and len(mono) == 64, str(mono.shape))
+        check("averages the channels", abs(float(mono[0]) - 0.6) < 1e-5, str(mono[0]))
+    finally:
+        _audio.sd.InputStream = real_stream
+
+    print("deterministic grammar pass")
+    from voxkey.cleanup.rules import fix_mechanical, fix_subject_pronouns
+
+    for said, want in [
+        ("i dont think it wont work", "i don't think it won't work"),
+        ("they could of tommorow", "they could have tomorrow"),
+        ("Dont do that", "Don't do that"),
+        ("we havent seperate configs", "we haven't separate configs"),
+    ]:
+        got = fix_mechanical(said)
+        check(f"fixes {said[:26]!r}", got == want, got)
+
+    # "id" and "im" are ordinary words and extremely common identifiers. An
+    # earlier table expanded them and turned "SELECT id" into "SELECT I'd".
+    for untouched in [
+        "the user.id field is wrong",
+        "get the id from the row",
+        "SELECT id FROM users",
+        "set im = load(path)",
+    ]:
+        check(f"leaves {untouched[:26]!r} alone", fix_mechanical(untouched) == untouched,
+              fix_mechanical(untouched))
+
+    # Code, URLs and paths are masked before the regex runs.
+    for text, must_survive in [
+        ("run `git commit --amend` it wont work", "`git commit --amend`"),
+        ("see https://a.com/x?dont=1 for it", "https://a.com/x?dont=1"),
+        ("open C:" + chr(92) + "Users" + chr(92) + "me" + chr(92) + "dont_touch.txt now",
+         "dont_touch.txt"),
+        ("the cant_fail flag isnt set", "cant_fail"),
+    ]:
+        out = fix_mechanical(text)
+        check(f"protects {must_survive[:24]!r}", must_survive in out, out)
+    check("still fixes outside a protected span",
+          "isn't set" in fix_mechanical("the cant_fail flag isnt set"))
+
+    for said, want in [
+        ("me and him seen it happen", "He and I seen it happen"),
+        ("Him and me went there", "He and I went there"),
+        ("me and Jude was thinking", "Jude and I was thinking"),
+    ]:
+        check(f"subject case {said[:24]!r}", fix_subject_pronouns(said) == want,
+              fix_subject_pronouns(said))
+    for object_case in ["between you and me this is bad", "she told him and me the news"]:
+        check(f"object case untouched {object_case[:22]!r}",
+              fix_subject_pronouns(object_case) == object_case)
+
     print("bar placement")
     from voxkey.overlay import POSITIONS
 

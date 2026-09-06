@@ -92,6 +92,7 @@ class Engine(QObject):
 
         self.hotkey = self._new_listener()
         self._blocked_for = 0
+        self._mic_warned = False
         self._watchdog = QTimer(self)
         self._watchdog.timeout.connect(self._check_health)
 
@@ -115,22 +116,33 @@ class Engine(QObject):
                 "Hotkey restarted", "The key listener had stopped. It is running again."
             )
             return
-        # The microphone is held open for the pre-roll buffer, and a stream that
-        # dies quietly turns every dictation into "Nothing heard".
-        if self.config.get("audio.preroll", True) and self.recorder.is_stalled():
-            log.error("the microphone stream stalled, reopening it")
-            device = self.config.get("audio.device")
-            self.recorder.close_monitor()
-            if self.recorder.open_monitor(device):
-                self.notice.emit(
-                    "Microphone reconnected",
-                    "The audio stream had stopped delivering. It is running again.",
+        # The microphone is held open for the pre-roll buffer. It can stall, and
+        # it can also fail to open in the first place: a virtual input device is
+        # often not ready in the 40ms between login and this process starting.
+        # Either way every dictation comes back silent, so both are retried.
+        if self.config.get("audio.preroll", True):
+            missing = not self.recorder.is_open
+            if missing or self.recorder.is_stalled():
+                log.error(
+                    "the microphone is %s, reopening it",
+                    "not open" if missing else "stalled",
                 )
-            else:
-                self.notice.emit(
-                    "Microphone unavailable", self.recorder.error or "the device went away"
-                )
-            return
+                device = audio_mod.resolve_device(self.config)
+                self.recorder.close_monitor()
+                if self.recorder.open_monitor(device):
+                    if self._mic_warned:
+                        self.notice.emit(
+                            "Microphone reconnected", "The audio stream is running again."
+                        )
+                    self._mic_warned = False
+                elif not self._mic_warned:
+                    # Once, not every five seconds for as long as it is unplugged.
+                    self._mic_warned = True
+                    self.notice.emit(
+                        "Microphone unavailable",
+                        self.recorder.error or "the device did not open",
+                    )
+                return
 
         # A modifier latched down by Windows stops the chord matching for as
         # long as it stays stuck, which looks exactly like the app being broken.
@@ -160,8 +172,12 @@ class Engine(QObject):
         if self.config.get("audio.preroll", True):
             # Hold the microphone open so the ring buffer already contains the
             # moment you started talking by the time the chord registers.
-            if not self.recorder.open_monitor(self.config.get("audio.device")):
-                log.warning("could not open the microphone: %s", self.recorder.error)
+            if not self.recorder.open_monitor(audio_mod.resolve_device(self.config)):
+                # Not fatal: the watchdog retries every five seconds, which is
+                # what a device that is still waking up needs.
+                log.warning(
+                    "could not open the microphone yet, will retry: %s", self.recorder.error
+                )
         if self.config.get("asr.preload_on_start", True):
             threading.Thread(target=self._preload, daemon=True, name="voxkey-preload").start()
 
@@ -189,7 +205,7 @@ class Engine(QObject):
         """Called when the device is changed in Settings."""
         self.recorder.close_monitor()
         if self.config.get("audio.preroll", True):
-            self.recorder.open_monitor(self.config.get("audio.device"))
+            self.recorder.open_monitor(audio_mod.resolve_device(self.config))
 
     @property
     def active_profile(self) -> str:
@@ -230,14 +246,14 @@ class Engine(QObject):
         """
         if self.busy or self.recorder.recording or not self.config.get("audio.preroll", True):
             return
-        if self.recorder.start(self.config.get("audio.device")):
+        if self.recorder.start(audio_mod.resolve_device(self.config)):
             self._armed_at = time.monotonic()
 
     def _begin(self) -> None:
         if self.busy:
             return
         if not self.recorder.recording:
-            device = self.config.get("audio.device")
+            device = audio_mod.resolve_device(self.config)
             if not self.recorder.start(device):
                 self.notice.emit(
                     "Microphone unavailable", self.recorder.error or "unknown error"

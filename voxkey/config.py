@@ -193,6 +193,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "audio": {
         "device": None,
+        # The name is what actually identifies the device. The index is only a
+        # hint, because PortAudio renumbers devices when hardware changes.
+        "device_name": "",
         "gain": 1.0,
         "min_duration_ms": 350,
         "max_duration_s": 300,
@@ -301,6 +304,9 @@ DEFAULTS: dict[str, Any] = {
         "scope": "all",          # all = Ctrl+A first, selection = use what is selected
         "profile": "grammar",
         "max_chars": 12000,
+        # Apply the certain corrections (missing apostrophes, "could of",
+        # subject-case pronouns) by rule before the model runs.
+        "deterministic_pass": True,
     },
     "context": {
         # Follow the window you are dictating into instead of one fixed profile.

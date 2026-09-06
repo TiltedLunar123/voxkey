@@ -34,6 +34,51 @@ def list_input_devices() -> list[tuple[int | None, str]]:
     return devices
 
 
+def resolve_device(config) -> int | None:
+    """A usable input device index, or None to mean the system default.
+
+    Device indices are not stable: PortAudio renumbers them whenever hardware
+    or a driver changes, so a saved index quietly starts pointing at something
+    else. A saved index here had become an HDMI output with zero input
+    channels, and every attempt to open it failed with "Invalid number of
+    channels" while the app reported it as the chosen microphone.
+    """
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+
+    def has_input(index: int) -> bool:
+        return 0 <= index < len(devices) and devices[index].get("max_input_channels", 0) > 0
+
+    wanted_name = (config.get("audio.device_name") or "").strip()
+    if wanted_name:
+        for index, info in enumerate(devices):
+            if info.get("max_input_channels", 0) > 0 and info["name"] == wanted_name:
+                return index
+
+    index = config.get("audio.device")
+    if index is None:
+        return None
+    if has_input(int(index)):
+        return int(index)
+    label = devices[int(index)]["name"] if 0 <= int(index) < len(devices) else "gone"
+    log.warning(
+        "saved input device %s is now %r with no input channels, using the system default",
+        index, label,
+    )
+    return None
+
+
+def device_name(index: int | None) -> str:
+    if index is None:
+        return ""
+    try:
+        return sd.query_devices(index)["name"]
+    except Exception:
+        return ""
+
+
 class Recorder:
     """Capture with a rolling pre-roll buffer.
 
@@ -53,6 +98,7 @@ class Recorder:
         self._level = 0.0
         self._peak = 0.0
         self._device: int | None = None
+        self._channels = 1
         self._last_block = 0.0
         self.error: str | None = None
         self.set_preroll(PREROLL_S)
@@ -61,6 +107,10 @@ class Recorder:
         blocks = max(1, int(seconds * SAMPLE_RATE / BLOCK))
         with self._lock:
             self._ring = deque(self._ring, maxlen=blocks)
+
+    @property
+    def is_open(self) -> bool:
+        return self._stream is not None
 
     @property
     def recording(self) -> bool:
@@ -79,7 +129,9 @@ class Recorder:
         self._last_block = time.monotonic()
         if status:
             log.debug("input stream status: %s", status)
-        block = indata[:, 0].copy()
+        # Whisper wants mono. Averaging rather than taking channel zero, because
+        # on some interfaces the microphone is wired to the right channel only.
+        block = indata[:, 0].copy() if indata.shape[1] == 1 else indata.mean(axis=1)
         with self._lock:
             self._ring.append(block)
             if self._capturing:
@@ -91,29 +143,53 @@ class Recorder:
             self._peak = max(self._peak, float(np.max(np.abs(block))))
 
     # -- stream lifecycle -------------------------------------------------
+    def _channel_options(self, device: int | None) -> list[int]:
+        """Mono first, then whatever the device actually offers.
+
+        Plenty of interfaces expose no mono mode at all: every input on the
+        machine this was built on reports two or four channels, and asking for
+        one gets "Invalid number of channels" from PortAudio.
+        """
+        options = [1]
+        try:
+            info = sd.query_devices(device, kind="input")
+            most = int(info.get("max_input_channels", 0))
+        except Exception:
+            most = 0
+        for count in (2, most):
+            if count > 1 and count not in options:
+                options.append(count)
+        return options
+
     def open_monitor(self, device: int | None = None) -> bool:
         """Hold the input stream open so the ring buffer is always warm."""
         if self._stream is not None and device == self._device:
             return True
         self.close_monitor()
         self.error = None
-        try:
-            self._stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                blocksize=BLOCK,
-                device=device,
-                callback=self._callback,
-            )
-            self._stream.start()
+        for channels in self._channel_options(device):
+            try:
+                stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=channels,
+                    dtype="float32",
+                    blocksize=BLOCK,
+                    device=device,
+                    callback=self._callback,
+                )
+                stream.start()
+            except Exception as exc:
+                self.error = str(exc)
+                continue
+            self._stream = stream
+            self._channels = channels
             self._device = device
             self._last_block = time.monotonic()
+            if channels > 1:
+                log.info("opened the microphone with %d channels, mixing to mono", channels)
             return True
-        except Exception as exc:
-            self.error = str(exc)
-            self._stream = None
-            return False
+        self._stream = None
+        return False
 
     def is_stalled(self, timeout: float = 1.5) -> bool:
         """Open, but no audio has arrived for a while.

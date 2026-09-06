@@ -139,6 +139,13 @@ def fix_text(pipeline: CleanupPipeline, text: str, on_status=None) -> ProfileRes
     if truncated:
         text = text[:limit]
 
+    # Settle the mechanical classes before the model sees the text. These are
+    # certain, they cost no tokens, and a 4B model kept getting subject-case
+    # pronouns wrong however the instruction was worded.
+    if config.get("fix.deterministic_pass", True):
+        text = rules.fix_mechanical(text)
+        text = rules.fix_subject_pronouns(text)
+
     instruction = pipeline.instruction_for(profile)
     examples = PROFILES.get(profile, {}).get("examples")
     chunks = _split_paragraphs(text, CHUNK_CHARS)

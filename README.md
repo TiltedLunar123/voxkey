@@ -140,11 +140,26 @@ The chord is a superset of the talk chord, which is deliberate: a binding only
 matches when the modifiers outside it are up, so holding Ctrl+Win+Alt cannot
 also start a dictation.
 
+Two passes, in that order. The certain classes are settled by rule before the
+model ever sees the text: missing apostrophes where the bare form is not a word
+(`dont`, `wouldnt`, `youre`), "could of" and "should of", a set of common
+misspellings, and subject-case pronouns, because "me and him" is never a correct
+subject. Those cost no tokens and cannot be got wrong. Everything needing
+judgement goes to the model.
+
+The rule pass masks inline code, URLs, Windows and Unix paths, dotted
+identifiers and snake_case names before it runs, so `user.id` and
+`C:\path\dont_touch.txt` come back untouched. `id` and `im` are deliberately
+absent from the table: both are ordinary words and extremely common identifiers,
+and expanding them turned `SELECT id` into `SELECT I'd`.
+
 Scored against ten held-out sentences that appear nowhere in its examples, it
-fixes 10 of 10; on ten error classes never named in its instruction, 9 of 10.
-That came from naming the error classes outright rather than asking for "correct
-grammar", which took it from 5 of 10. A 7B model was tried and scored *worse*,
-because it expands contractions and so changes your register.
+fixes 10 of 10; on ten error classes never named in its instruction, 9 of 10;
+on a harder set covering multi-error paragraphs and preservation of code, paths,
+URLs, bullet lists and already-correct prose, 10 of 10. Naming the error classes
+outright rather than asking for "correct grammar" is what took it from 5 of 10.
+A 7B model was tried and scored *worse*, because it expands contractions and so
+changes your register.
 
 Guards worth knowing about:
 
@@ -173,6 +188,19 @@ If you would rather the microphone were only open while dictating, turn off
 "Catch speech from before the key registers" under All settings, Audio. The
 first word will be clipped again; nothing is recorded to disk either way and no
 audio leaves the machine.
+
+The chosen input device is remembered by name, not by index. PortAudio
+renumbers devices whenever hardware or a driver changes, and a saved index here
+had drifted onto an HDMI output with no input channels at all: the app went on
+reporting it as the selected microphone while every attempt to open it failed.
+An index that no longer points at an input is now detected and the system
+default used instead.
+
+The microphone is opened as mono when the device allows it, and otherwise at
+whatever channel count it does offer, mixed down by averaging. That is not
+theoretical either: every input device on the machine this was built on reports
+two or four channels and none offers mono, so asking for one channel returns
+"Invalid number of channels" from PortAudio.
 
 Near-silent clips are dropped rather than transcribed. Handed silence, Whisper
 confidently returns "Thank you.", which is exactly what a 1.1 second empty take
