@@ -66,7 +66,6 @@ class Engine(QObject):
         self.overlay = Overlay(config)
         self.busy = False
         self._started_at = 0.0
-        self._profile_override: str | None = None
         self._session_profile = ""
         self._armed_at = 0.0
         self._active_session = False
@@ -192,12 +191,9 @@ class Engine(QObject):
         if self.config.get("audio.preroll", True):
             self.recorder.open_monitor(self.config.get("audio.device"))
 
-    def set_profile_override(self, profile: str | None) -> None:
-        self._profile_override = profile
-
     @property
     def active_profile(self) -> str:
-        return self._profile_override or self.config.get("cleanup.profile", "clean")
+        return self.config.get("cleanup.profile", "clean")
 
     def resolve_profile(self) -> tuple[str, str]:
         """Which profile this dictation should use, and why.
@@ -205,8 +201,6 @@ class Engine(QObject):
         Order: an explicit override, then what you have actually chosen in this
         app before, then the shipped rules, then the default.
         """
-        if self._profile_override:
-            return self._profile_override, "set by hand"
         app, title = context_mod.foreground_window()
         self.last_app = app
         if not self.config.get("context.auto_profile", True):

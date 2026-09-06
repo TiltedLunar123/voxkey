@@ -55,14 +55,34 @@ Flow's does.
 
 It sits bottom right and dims to half opacity when idle, so it stays clear of
 the text box you are dictating into, then brightens on hover and while working.
-Drag it anywhere and it snaps to the nearest screen edge and stays there next
-time. Right-click for Settings, History, Paste last transcript, Hide for an
+Put it in any corner or edge from the settings window, or from its own
+right-click menu under Move to. Drag it and it snaps to the nearest screen edge
+and stays where you left it. Right-click for Settings, History, Paste last transcript, Hide for an
 hour, and a toggle for whether it stays up when idle.
 
 The bar carries `WS_EX_NOACTIVATE`, so clicking it never takes focus off the
 window you were typing in. That matters: if it stole focus, Stop would paste
 your text into the bar instead of your document. It is also a tool window, so
 it stays out of alt-tab and off the taskbar.
+
+## When it stops working
+
+There is a **Diagnostics** tab under All settings. It reports, live, every part
+that can fail without saying so: whether the key listener is running, whether
+any key is stuck down, whether the audio stream is actually delivering, the live
+input level, which models are loaded, and when the last dictation was. "Copy
+report" puts the lot on the clipboard.
+
+That tab exists because three different faults all present identically as "the
+hotkey stopped working": a key latched down by Windows, an input stream that
+died without raising, and an unhandled exception under `pythonw.exe`, which has
+no stderr to print to. All three are now written to
+`%APPDATA%\VoxKey\voxkey.log` as they happen, and the app recovers from the
+first two on its own.
+
+The stall detector is not hypothetical: it fired twice in half an hour of
+ordinary use on the machine this was built on, and reopened the device both
+times.
 
 ## What it does with your words
 

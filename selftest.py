@@ -161,6 +161,19 @@ def main() -> int:
         got = apply_self_corrections(said)
         check(f"discard: {said[:30]!r}", got == want, got)
 
+    print("bar placement")
+    from voxkey.overlay import POSITIONS
+
+    keys = [k for _label, k in POSITIONS]
+    check("default position is a real preset",
+          config.get("ui.bar_position") in keys, str(config.get("ui.bar_position")))
+    check("dragging is representable", "custom" in keys)
+    for key in keys:
+        if key == "custom":
+            continue
+        vertical, _, horizontal = key.partition("-")
+        check(f"{key} parses", vertical in ("top", "bottom") and horizontal in ("left", "center", "right"))
+
     print("stuck-key immunity")
     from voxkey.hotkey import TYPING_VKS
 

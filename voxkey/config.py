@@ -282,6 +282,7 @@ DEFAULTS: dict[str, Any] = {
         # The bar sits on screen all the time, like the Wispr Flow Bar, and
         # remembers where it was dragged to.
         "bar_always": True,
+        "bar_position": "bottom-right",   # a POSITIONS key, or "custom" once dragged
         "bar_x": -1,
         "bar_y": -1,
         # Sits dim and out of the way until you need it, so it stops covering
