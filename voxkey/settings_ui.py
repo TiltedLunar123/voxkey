@@ -415,6 +415,9 @@ class SettingsWindow(QMainWindow):
 
     def _device_changed(self, device, source=None, mirror=None) -> None:
         self._write("audio.device", device)
+        # Record the name too: it is what survives a driver reload, and an index
+        # on its own had already drifted onto an HDMI output.
+        self._write("audio.device_name", audio_mod.device_name(device))
         if mirror is not None:
             mirror.blockSignals(True)
             found = mirror.findData(device)
@@ -436,7 +439,7 @@ class SettingsWindow(QMainWindow):
             self._simple_test.setText("Test")
             self._test_hint.setText("Speak normally. A healthy level sits around the middle.")
             return
-        if not self.engine.recorder.open_monitor(self.config.get("audio.device")):
+        if not self.engine.recorder.open_monitor(audio_mod.resolve_device(self.config)):
             self._test_hint.setText(f"Could not open that device: {self.engine.recorder.error}")
             return
         self._test_timer.start(33)
@@ -1849,13 +1852,15 @@ class SettingsWindow(QMainWindow):
         else:
             blocked = "nothing in the way"
 
-        device = self.config.get("audio.device")
+        wanted = self.config.get("audio.device")
+        device = audio_mod.resolve_device(self.config)
         device_name = "System default"
-        if device is not None:
-            for index, label in audio_mod.list_input_devices():
-                if index == device:
-                    device_name = label
-                    break
+        for index, label in audio_mod.list_input_devices():
+            if index == device and index is not None:
+                device_name = label
+                break
+        if wanted is not None and device != wanted:
+            device_name += "   (the saved device is gone, fell back)"
 
         if not self.config.get("audio.preroll", True):
             stream = "opened only while dictating"

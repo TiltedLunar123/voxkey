@@ -199,3 +199,110 @@ def run(text: str, cfg, level: str, protect_corrections: bool = False) -> str:
 
     text = apply_replacements(text, cfg.get("cleanup.replacements", []))
     return tidy_spacing(text)
+
+
+# -- deterministic grammar, for the classes a regex is simply better at -----
+
+# Written forms that are not English words without their apostrophe, so the
+# correction is never ambiguous. its/your/were/theirs are all excluded because
+# each one is a real word and needs context the model has and a regex does not.
+_APOSTROPHE = {
+    "dont": "don't", "doesnt": "doesn't", "didnt": "didn't", "wont": "won't",
+    "cant": "can't", "isnt": "isn't", "arent": "aren't", "wasnt": "wasn't",
+    "werent": "weren't", "havent": "haven't", "hasnt": "hasn't", "hadnt": "hadn't",
+    "wouldnt": "wouldn't", "couldnt": "couldn't", "shouldnt": "shouldn't",
+    "mustnt": "mustn't", "youre": "you're", "theyre": "they're", "weve": "we've",
+    "youve": "you've", "ive": "I've", "whats": "what's",
+    "thats": "that's", "theres": "there's", "heres": "here's", "wheres": "where's",
+    "hows": "how's", "whos": "who's", "somethings": "something's",
+    # Deliberately absent: "id" and "im". Both are ordinary words in prose and
+    # extremely common identifiers in code, so expanding them to "I'd" and "I'm"
+    # corrupts far more than it fixes.
+}
+_MISSPELLING = {
+    "alot": "a lot", "teh": "the", "recieve": "receive", "seperate": "separate",
+    "definately": "definitely", "occured": "occurred", "untill": "until",
+    "becuase": "because", "thier": "their", "freind": "friend", "wierd": "weird",
+    "acheive": "achieve", "beleive": "believe", "accomodate": "accommodate",
+    "tommorow": "tomorrow", "calender": "calendar", "neccessary": "necessary",
+    "recomend": "recommend", "succesful": "successful", "publically": "publicly",
+    "maintainance": "maintenance", "existance": "existence", "occurence": "occurrence",
+}
+_OF_FOR_HAVE = re.compile(
+    r"\b(could|should|would|must|might)\s+of\b", re.IGNORECASE
+)
+
+# "Me and him" is never a correct subject. Restricted to the start of a
+# sentence, which is the position that guarantees subject case and keeps
+# "between you and me" untouched.
+_SUBJECT_PAIR = re.compile(
+    r"(?:^|(?<=[.!?\n])\s*)"
+    r"(?:me and (him|her|them|[A-Z][a-z]+)|(him|her|them|[A-Z][a-z]+) and me)\b",
+)
+_SUBJECT_CASE = {"him": "He", "her": "She", "them": "They"}
+
+
+# Regions the mechanical pass must never touch. The model is told to leave code
+# alone and does; a regex has no such judgement.
+_PROTECTED = re.compile(
+    r"`[^`]*`"                       # inline code
+    r"|https?://\S+|www\.\S+"        # urls
+    r"|[A-Za-z]:\[^\s]+"            # windows paths
+    r"|(?<![\w.])\.{0,2}/[^\s]{2,}"   # unix paths and ./ ../
+    r"|\w+(?:\.\w+)+"                # user.id, settings.json, example.com
+    r"|\w*_\w+"                      # snake_case identifiers
+)
+
+
+def _without_protected(text: str, transform) -> str:
+    """Run a transform with code, paths and URLs masked out of the way."""
+    stash: list[str] = []
+
+    def hide(match: re.Match) -> str:
+        stash.append(match.group(0))
+        return f"{len(stash) - 1}"
+
+    masked = _PROTECTED.sub(hide, text)
+    result = transform(masked)
+    for index, original in enumerate(stash):
+        result = result.replace(f"{index}", original)
+    return result
+
+
+def _match_case(replacement: str, original: str) -> str:
+    if original.isupper():
+        return replacement.upper()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def fix_mechanical(text: str) -> str:
+    """Corrections that are certain, so the model never has to spend a token."""
+    return _without_protected(text, _fix_mechanical)
+
+
+def _fix_mechanical(text: str) -> str:
+    def swap(match: re.Match) -> str:
+        word = match.group(0)
+        target = _APOSTROPHE.get(word.lower()) or _MISSPELLING.get(word.lower())
+        return _match_case(target, word) if target else word
+
+    known = sorted(set(_APOSTROPHE) | set(_MISSPELLING), key=len, reverse=True)
+    text = re.sub(rf"(?<!\w)(?:{'|'.join(known)})(?!\w)", swap, text, flags=re.IGNORECASE)
+    return _OF_FOR_HAVE.sub(lambda m: f"{m.group(1)} have", text)
+
+
+def fix_subject_pronouns(text: str) -> str:
+    """"Me and him seen it" -> "He and I saw it", for the subject position only."""
+    return _without_protected(text, _fix_subject_pronouns)
+
+
+def _fix_subject_pronouns(text: str) -> str:
+    def swap(match: re.Match) -> str:
+        other = match.group(1) or match.group(2)
+        subject = _SUBJECT_CASE.get(other.lower(), other)
+        lead = match.group(0)[: len(match.group(0)) - len(match.group(0).lstrip())]
+        return f"{lead}{subject} and I"
+
+    return _SUBJECT_PAIR.sub(swap, text)
