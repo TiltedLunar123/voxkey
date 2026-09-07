@@ -45,9 +45,13 @@ STATES = {
     "transcribing": ("Transcribing", QColor(129, 178, 255)),
     "rewriting": ("Rewriting", QColor(196, 160, 255)),
     "done": ("Sent", QColor(134, 239, 172)),
+    "copied": ("Copied", QColor(250, 204, 21)),
     "error": ("Failed", QColor(248, 113, 113)),
     "cancelled": ("Cancelled", QColor(148, 163, 184)),
 }
+# States whose message needs more room than a one-word status.
+WIDE_STATES = {"copied", "error"}
+WIDE_SIZE = (206, 30)
 
 POSITIONS = [
     ("Bottom right", "bottom-right"),
@@ -135,6 +139,8 @@ class Overlay(QWidget):
             width, height = IDLE_SIZE
         elif self.state == "listening":
             width, height = ACTIVE_SIZE
+        elif self.state in WIDE_STATES:
+            width, height = WIDE_SIZE
         else:
             width, height = BUSY_SIZE
         # Anchor on where a running grow is heading, not where it is now, so a
@@ -500,43 +506,7 @@ class Overlay(QWidget):
         self._zones["body"] = self.rect()
 
     def _draw_mic(self, painter: QPainter, box: QRect, colour: QColor) -> None:
-        """A microphone: capsule, cradle, stem, base.
-
-        Proportions are fractions of the box so it stays right at any size. The
-        cradle is a clean half circle, which puts its arms level with the bottom
-        of the capsule; a shallower arc reads as a smile under a blob instead.
-        """
-        left, top = box.left(), box.top()
-        size = min(box.width(), box.height())
-
-        def px(fx: float, fy: float) -> tuple[float, float]:
-            return left + fx * size, top + fy * size
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(colour)
-        body_x, body_y = px(0.33, 0.04)
-        body_w, body_h = 0.34 * size, 0.50 * size
-        painter.drawRoundedRect(
-            QRectF(body_x, body_y, body_w, body_h), body_w / 2, body_w / 2
-        )
-
-        pen = QPen(colour, max(1.3, size * 0.075))
-        pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-
-        arc_x, arc_y = px(0.20, 0.28)
-        painter.drawArc(
-            QRectF(arc_x, arc_y, 0.60 * size, 0.48 * size), 180 * 16, 180 * 16
-        )
-
-        stem_x, stem_top_y = px(0.5, 0.76)
-        _, stem_bottom_y = px(0.5, 0.91)
-        painter.drawLine(QPointF(stem_x, stem_top_y), QPointF(stem_x, stem_bottom_y))
-
-        base_left_x, base_y = px(0.34, 0.91)
-        base_right_x, _ = px(0.66, 0.91)
-        painter.drawLine(QPointF(base_left_x, base_y), QPointF(base_right_x, base_y))
+        draw_mic(painter, box, colour)
 
     def _draw_round_button(
         self, painter: QPainter, box: QRect, colour: QColor, glyph: str, zone: str
@@ -643,6 +613,43 @@ class Overlay(QWidget):
         self.config.set("ui.bar_always", bool(on))
         self.config.save()
         self.refresh_visibility()
+
+
+def draw_mic(painter: QPainter, box: QRect, colour: QColor) -> None:
+    """A microphone: capsule, cradle, stem, base.
+
+    Proportions are fractions of the box so it stays right at any size, which
+    is why the app icon is drawn with this too. The cradle is a clean half
+    circle, which puts its arms level with the bottom of the capsule; a
+    shallower arc reads as a smile under a blob instead.
+    """
+    left, top = box.left(), box.top()
+    size = min(box.width(), box.height())
+
+    def px(fx: float, fy: float) -> tuple[float, float]:
+        return left + fx * size, top + fy * size
+
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(colour)
+    body_x, body_y = px(0.33, 0.04)
+    body_w, body_h = 0.34 * size, 0.50 * size
+    painter.drawRoundedRect(QRectF(body_x, body_y, body_w, body_h), body_w / 2, body_w / 2)
+
+    pen = QPen(colour, max(1.3, size * 0.075))
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    arc_x, arc_y = px(0.20, 0.28)
+    painter.drawArc(QRectF(arc_x, arc_y, 0.60 * size, 0.48 * size), 180 * 16, 180 * 16)
+
+    stem_x, stem_top_y = px(0.5, 0.76)
+    _, stem_bottom_y = px(0.5, 0.91)
+    painter.drawLine(QPointF(stem_x, stem_top_y), QPointF(stem_x, stem_bottom_y))
+
+    base_left_x, base_y = px(0.34, 0.91)
+    base_right_x, _ = px(0.66, 0.91)
+    painter.drawLine(QPointF(base_left_x, base_y), QPointF(base_right_x, base_y))
 
 
 def _clock(seconds: float) -> str:

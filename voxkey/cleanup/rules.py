@@ -167,6 +167,101 @@ def apply_replacements(text: str, replacements: list[dict]) -> str:
     return text
 
 
+# -- snapping names to the vocabulary ---------------------------------------
+
+_SNAP_WORD = re.compile(r"[A-Za-z][A-Za-z'’]*")
+_SOUNDEX_CODES = str.maketrans(
+    "bfpvcgjkqsxzdtlmnr", "111122222222334556"
+)
+
+
+def soundex(word: str) -> str:
+    """Plain American Soundex: the first letter, then three digits for the
+    consonants that follow. "Nectar" and "Nekter" both come out as N236."""
+    letters = [c for c in word.lower() if c.isalpha()]
+    if not letters:
+        return ""
+    head = letters[0].upper()
+    coded = "".join(letters).translate(_SOUNDEX_CODES)
+    digits = []
+    previous = coded[0]
+    for code in coded[1:]:
+        if code.isdigit() and code != previous:
+            digits.append(code)
+        # h and w do not separate two of the same code; vowels do.
+        if code not in "hw":
+            previous = code
+    return (head + "".join(digits) + "000")[:4]
+
+
+def _sounds_like(heard: str, wanted: str) -> bool:
+    if heard.lower() == wanted.lower():
+        return True
+    if soundex(heard) != soundex(wanted):
+        return False
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, heard.lower(), wanted.lower()).ratio() >= 0.6
+
+
+def snap_to_vocabulary(text: str, vocabulary: list[str]) -> str:
+    """Replace a name the recogniser nearly got with the one in the vocabulary.
+
+    Whisper writes a name it does not know as the nearest thing it does know,
+    so "Nekter" comes out as "Nectar". The vocabulary hint helps, but not
+    always. This looks for a run of words that sound like a vocabulary term
+    and swaps it, under two conditions that keep it out of ordinary prose: the
+    heard word must be capitalised somewhere other than the start of a
+    sentence, which is Whisper's own signal that it thought it heard a name,
+    or the term must be several words long and every one of them must match.
+    A lower-case "cloud" in "cloud storage" is never touched, whatever is in
+    the list.
+    """
+    terms = [t.strip() for t in vocabulary if t.strip() and _SNAP_WORD.fullmatch(t.strip().replace(" ", "a"))]
+    if not terms or not text:
+        return text
+    # Filenames, paths and identifiers are masked first, the same as for the
+    # grammar rules, so Nectar.txt keeps its name.
+    return _without_protected(text, lambda masked: _snap(masked, terms))
+
+
+def _snap(text: str, terms: list[str]) -> str:
+    tokens = list(_SNAP_WORD.finditer(text))
+    if not tokens:
+        return text
+    lowered = {t.lower() for t in terms}
+    edits: list[tuple[int, int, str]] = []
+    taken = 0
+    for start_index, token in enumerate(tokens):
+        if token.start() < taken:
+            continue
+        preceding = text[:token.start()].rstrip()
+        sentence_start = not preceding or preceding[-1] in ".!?\n"
+        for term in sorted(terms, key=len, reverse=True):
+            parts = term.split()
+            window = tokens[start_index:start_index + len(parts)]
+            if len(window) != len(parts):
+                continue
+            heard = [w.group(0) for w in window]
+            if " ".join(heard).lower() in lowered or " ".join(heard) == term:
+                break  # already right
+            # Words in between must be adjacent, not separated by punctuation.
+            span = text[window[0].start():window[-1].end()]
+            if any(c in span for c in ".,;:!?\n"):
+                continue
+            if not all(_sounds_like(h, w) for h, w in zip(heard, parts)):
+                continue
+            named = heard[0][:1].isupper() and not sentence_start
+            if not named and len(parts) < 2:
+                continue
+            edits.append((window[0].start(), window[-1].end(), term))
+            taken = window[-1].end()
+            break
+    for start, end, term in reversed(edits):
+        text = text[:start] + term + text[end:]
+    return text
+
+
 def run(text: str, cfg, level: str, protect_corrections: bool = False) -> str:
     """level is one of: minimal, punctuation, clean.
 
@@ -175,6 +270,8 @@ def run(text: str, cfg, level: str, protect_corrections: bool = False) -> str:
     if not text.strip():
         return ""
     text = tidy_spacing(text)
+    if cfg.get("cleanup.snap_vocabulary", True):
+        text = snap_to_vocabulary(text, cfg.get("asr.vocabulary", []))
 
     if level in ("punctuation", "clean") and cfg.get("cleanup.voice_commands", True):
         text = apply_voice_commands(text, cfg.get("cleanup.voice_command_list", []))

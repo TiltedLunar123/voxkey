@@ -153,14 +153,8 @@ class OllamaClient:
             )
         return f"{prompt}\nYour task: {instruction.strip()}"
 
-    def rewrite(
-        self,
-        text: str,
-        instruction: str,
-        on_status: Callable[[str], None] | None = None,
-        examples: list[tuple[str, str]] | None = None,
-    ) -> str:
-        model = self.config.get("llm.model", "qwen3:4b-instruct")
+    @staticmethod
+    def _shots(examples: list[tuple[str, str]] | None) -> list[dict[str, str]]:
         # The injection turn first, then the profile's own worked examples. The
         # first of those is deliberately a question, so "keep a question a
         # question" and "edit in this profile's style" are taught by the same
@@ -171,6 +165,36 @@ class OllamaClient:
                 {"role": "user", "content": f"<<<TRANSCRIPT\n{source}\nTRANSCRIPT>>>"},
                 {"role": "assistant", "content": target},
             ]
+        return shots
+
+    def shot_targets(
+        self, examples: list[tuple[str, str]] | None, use_shots: bool = True
+    ) -> list[str]:
+        """Every example answer the prompt carried, so a rewrite can be checked
+        for having copied one of them instead of editing the transcript."""
+        if not use_shots:
+            return []
+        return [turn["content"] for turn in self._shots(examples) if turn["role"] == "assistant"]
+
+    def rewrite(
+        self,
+        text: str,
+        instruction: str,
+        on_status: Callable[[str], None] | None = None,
+        examples: list[tuple[str, str]] | None = None,
+        temperature: float | None = None,
+        use_shots: bool = True,
+    ) -> str:
+        """One pass through the model.
+
+        use_shots=False sends the instruction and the transcript with no worked
+        examples at all. That is the retry path when a rewrite has been caught
+        reproducing an example, since a model cannot copy what it was not shown.
+        """
+        model = self.config.get("llm.model", "qwen3:4b-instruct")
+        shots = self._shots(examples) if use_shots else []
+        if temperature is None:
+            temperature = float(self.config.get("llm.temperature", 0.2))
         payload = {
             "model": model,
             "messages": [
@@ -184,8 +208,13 @@ class OllamaClient:
             "stream": False,
             "keep_alive": self.config.get("llm.keep_alive", "10m"),
             "options": {
-                "temperature": float(self.config.get("llm.temperature", 0.2)),
+                "temperature": temperature,
                 "num_ctx": int(self.config.get("llm.num_ctx", 4096)),
+                # A rewrite is never much longer than what went in. Without a
+                # ceiling a model that starts looping runs until the timeout,
+                # and the user waits half a minute for nothing. Temperature and
+                # this are runtime options; only num_ctx forces a reload.
+                "num_predict": int(len(text) * 0.7) + 96,
             },
         }
         timeout = float(self.config.get("llm.timeout_s", 30))
