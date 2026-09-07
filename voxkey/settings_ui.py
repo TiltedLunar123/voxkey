@@ -75,7 +75,7 @@ _DIAG_LABELS = {
     "listener": "Key listener", "chord": "Talk chord", "blocked": "Blocked by",
     "device": "Input device", "stream": "Audio stream", "level": "Live level",
     "speech": "State", "speech_device": "Model", "ollama": "Ollama",
-    "llm_model": "Model", "last": "Most recent",
+    "llm_model": "Model", "guard": "Last rewrite", "last": "Most recent",
 }
 
 
@@ -115,7 +115,7 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.engine = engine
         self.config = engine.config
-        self.setWindowTitle("VoxKey settings")
+        self.setWindowTitle("VoxKey")
         self.resize(880, 720)
         self.setStyleSheet(STYLE)
 
@@ -512,13 +512,25 @@ class SettingsWindow(QMainWindow):
             "Carry context between dictations", "asr.condition_on_previous_text",
             "Off by default. On, Whisper is more fluent but can repeat itself.",
         ))
+        decode_form.addRow("", self.check(
+            "Remind it what you said last time", "asr.use_context",
+            "The end of your previous dictation, if it was within ten minutes, is "
+            "handed over as context, so names and jargon from it are heard right again.",
+        ))
+        decode_form.addRow("", hint(
+            "Whisper gets the recogniser's own recovery too: a window that decodes "
+            "into a stuck loop is retried at a higher temperature, and any phrase it "
+            "still repeats is folded to one."
+        ))
         layout.addWidget(decoding)
 
         vocab_box = QGroupBox("Vocabulary")
         vocab_layout = QVBoxLayout(vocab_box)
         vocab_layout.addWidget(hint(
             "Names and jargon Whisper otherwise mangles. These are fed to the model as "
-            "a hint, so spell them exactly how you want them written."
+            "hotwords for every window it decodes, so spell them exactly how you want "
+            "them written. A name it still gets nearly right, capitalised, is snapped "
+            "to the closest of these afterwards: Nectar to Nekter, if Nekter is here."
         ))
         self._vocab_list = QListWidget()
         self._vocab_list.setMaximumHeight(150)
@@ -641,6 +653,11 @@ class SettingsWindow(QMainWindow):
         rules_layout = QVBoxLayout(rules_box)
         rules_layout.addWidget(self.check("Turn spoken punctuation into real punctuation", "cleanup.voice_commands"))
         rules_layout.addWidget(self.check("Fold stutters and repeated words", "cleanup.collapse_repeats"))
+        rules_layout.addWidget(self.check(
+            "Snap names that sound like a vocabulary word to that word", "cleanup.snap_vocabulary",
+            "Only a capitalised word mid-sentence, or a whole multi-word term, is "
+            "changed, so ordinary words are left alone.",
+        ))
         rules_layout.addWidget(self.check("Capitalise sentences", "cleanup.capitalize_sentences"))
         rules_layout.addWidget(self.check("Add a full stop at the end", "cleanup.ensure_final_punctuation"))
         rules_layout.addWidget(self.check(
@@ -719,6 +736,8 @@ class SettingsWindow(QMainWindow):
         self._preview_out.setPlainText(result.text)
         engine = "model" if result.used_llm else "rules"
         note = f"{PROFILES[result.profile]['label']} via {engine}, {result.ms:.0f} ms"
+        if result.guard == "retried":
+            note += ", retried without examples"
         if result.warning:
             note += f"  -  {result.warning}"
         self._preview_note.setText(note)
@@ -927,6 +946,21 @@ class SettingsWindow(QMainWindow):
             "On, a dead Ollama costs you tone, not your words.",
         ))
         layout.addWidget(tuning)
+
+        guard_box = QGroupBox("Checking its work")
+        guard_layout = QVBoxLayout(guard_box)
+        guard_layout.addWidget(self.check(
+            "Discard a rewrite that drifts from what you said", "llm.fidelity_guard",
+            "Compares the rewrite with the transcript. A bad one is retried once without "
+            "the worked examples, and if that is also off, Clean up is used instead.",
+        ))
+        guard_layout.addWidget(hint(
+            "A small model occasionally hands back one of the worked examples it was "
+            "shown in place of your words, or keeps the first half of a long dictation "
+            "and drops the rest. This catches both. The Prompt and Grammar profiles also "
+            "run at temperature zero, since their whole job is to keep what you said."
+        ))
+        layout.addWidget(guard_box)
         layout.addStretch(1)
         return page
 
@@ -1060,6 +1094,20 @@ class SettingsWindow(QMainWindow):
             "Sends the message straight away in a chat box. Careful in a code editor.",
         ))
         layout.addWidget(after_box)
+
+        focus_box = QGroupBox("When nothing is there to paste into")
+        focus_layout = QVBoxLayout(focus_box)
+        focus_layout.addWidget(self.check(
+            "Copy to the clipboard instead, and say so", "output.require_text_field",
+            "Asks Windows what has keyboard focus. If it is a list, a button, the "
+            "desktop or a page with no box selected, the paste would go nowhere.",
+        ))
+        focus_layout.addWidget(hint(
+            "Whisper Flow does the same. The bar says \"Copied, no text box\", a "
+            "notification explains what had focus, and Ctrl+V puts the words wherever "
+            "you click next. Anything VoxKey cannot identify is pasted as before."
+        ))
+        layout.addWidget(focus_box)
         layout.addStretch(1)
         return page
 
@@ -1181,8 +1229,18 @@ class SettingsWindow(QMainWindow):
         start_layout.addWidget(self._startup_note)
         start_layout.addWidget(self.check(
             "Start hidden in the tray", "ui.start_minimized",
-            "Off, the settings window opens each time VoxKey launches.",
+            "Applies to the automatic start at login. Opening VoxKey yourself, from the "
+            "Start menu or a double-click, always shows this window.",
         ))
+        self._register_check = QCheckBox("Show VoxKey in the Start menu and under Installed apps")
+        self._register_check.setChecked(bool(self.config.get("advanced.register_app", True)))
+        self._register_check.toggled.connect(self._toggle_register)
+        start_layout.addWidget(self._register_check)
+        self._register_note = hint(
+            "Search for VoxKey in the Start menu to open this window, whether or not it is "
+            "already running in the tray."
+        )
+        start_layout.addWidget(self._register_note)
         layout.addWidget(start_box)
 
         feedback = QGroupBox("Feedback while dictating")
@@ -1250,6 +1308,13 @@ class SettingsWindow(QMainWindow):
             self._startup_check.blockSignals(True)
             self._startup_check.setChecked(startup.is_enabled())
             self._startup_check.blockSignals(False)
+
+    def _toggle_register(self, enabled: bool) -> None:
+        from . import register
+
+        self._write("advanced.register_app", bool(enabled))
+        _ok, message = register.register() if enabled else register.unregister()
+        self._register_note.setText(message)
 
     def _open_log(self) -> None:
         if LOG_PATH.exists():
@@ -1751,9 +1816,10 @@ class SettingsWindow(QMainWindow):
         form.addRow("Stop after", self.spin("fix.max_chars", 500, 100000, " characters", 500))
         layout.addLayout(form)
         layout.addWidget(hint(
-            "Longer text is split on blank lines and fixed a few paragraphs at a time. "
-            "If the window loses focus while it is working, the corrected text goes to "
-            "the clipboard rather than into the wrong place."
+            "The text is fixed in sentence-sized pieces, which is what keeps a long "
+            "paragraph's last line intact. If the window loses focus while it is "
+            "working, the corrected text goes to the clipboard rather than into the "
+            "wrong place."
         ))
         self._refresh_fix_preview()
         return box
@@ -1800,7 +1866,7 @@ class SettingsWindow(QMainWindow):
             ("Hotkey", ["listener", "chord", "blocked"]),
             ("Microphone", ["device", "stream", "level"]),
             ("Speech model", ["speech", "speech_device"]),
-            ("Rewriter", ["ollama", "llm_model"]),
+            ("Rewriter", ["ollama", "llm_model", "guard"]),
             ("Last dictation", ["last"]),
         ):
             box = QGroupBox(section)
@@ -1905,6 +1971,7 @@ class SettingsWindow(QMainWindow):
             "speech_device": f"{self.config.get('asr.model')} on {transcriber.last_device}",
             "ollama": ollama,
             "llm_model": model_name,
+            "guard": engine.pipeline.last_guard,
             "last": last,
         }
 
@@ -1914,7 +1981,7 @@ class SettingsWindow(QMainWindow):
             if row is None:
                 continue
             row.setText(value)
-            bad = value.startswith(("NOT", "STALLED")) or "is held down" in value
+            bad = value.startswith(("NOT", "STALLED", "REJECTED")) or "is held down" in value
             row.setStyleSheet("color:#f87171;" if bad else "")
 
     def _copy_diagnostics(self) -> None:

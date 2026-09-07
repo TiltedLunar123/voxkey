@@ -74,7 +74,7 @@ class Tray(QSystemTrayIcon):
 
         menu.addSeparator()
         quit_action = menu.addAction("Quit VoxKey")
-        quit_action.triggered.connect(self._quit)
+        quit_action.triggered.connect(self.quit_app)
 
         self.setContextMenu(menu)
         self.activated.connect(self._activated)
@@ -113,7 +113,8 @@ class Tray(QSystemTrayIcon):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self._open_settings()
 
-    def _quit(self) -> None:
+    def quit_app(self) -> None:
+        """Also what a second launch with --quit asks the running copy to do."""
         from PySide6.QtWidgets import QApplication
 
         self.engine.shutdown()

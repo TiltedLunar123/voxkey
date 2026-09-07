@@ -216,6 +216,9 @@ DEFAULTS: dict[str, Any] = {
         "condition_on_previous_text": False,
         "vocabulary": list(DEFAULT_VOCABULARY),
         "preload_on_start": True,
+        # Hand the recogniser the end of the previous dictation as context, so
+        # a name said ten minutes ago is still fresh in its mind.
+        "use_context": True,
     },
     "cleanup": {
         "profile": "clean",
@@ -240,6 +243,9 @@ DEFAULTS: dict[str, Any] = {
             {"say": "dash", "insert": "-", "enabled": False},
         ],
         "collapse_repeats": True,
+        # "Nectar" becomes "Nekter" when Nekter is in the vocabulary and the
+        # recogniser capitalised what it heard.
+        "snap_vocabulary": True,
         "capitalize_sentences": True,
         "ensure_final_punctuation": True,
         "strip_trailing_period_short": True,
@@ -267,6 +273,9 @@ DEFAULTS: dict[str, Any] = {
         "num_ctx": 4096,
         "keep_alive": "10m",
         "fallback_to_rules": True,
+        # Check every rewrite for copied examples and dropped content, retry
+        # once without examples, and fall back to the rules if it is still off.
+        "fidelity_guard": True,
     },
     "output": {
         "method": "paste",
@@ -278,6 +287,9 @@ DEFAULTS: dict[str, Any] = {
         # smart: add a space only when this dictation continues the previous one
         # in the same window. always / never override it.
         "leading_space": "smart",
+        # When nothing that takes text has focus, leave the dictation on the
+        # clipboard and say so, instead of pasting into thin air.
+        "require_text_field": True,
     },
     "ui": {
         "overlay": True,
@@ -318,7 +330,13 @@ DEFAULTS: dict[str, Any] = {
         "profiles": True,     # remember which profile you pick in which app
     },
     "history": {"enabled": True, "max_items": 100},
-    "advanced": {"start_with_windows": True, "log_level": "INFO"},
+    "advanced": {
+        "start_with_windows": True,
+        # A Start menu shortcut and an Installed apps entry, kept in step with
+        # wherever the folder currently is.
+        "register_app": True,
+        "log_level": "INFO",
+    },
 }
 
 

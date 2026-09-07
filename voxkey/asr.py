@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .cleanup.guard import collapse_loops
+
 log = logging.getLogger("voxkey.asr")
 
 # label -> (repo id understood by faster-whisper, rough download size)
@@ -32,6 +34,10 @@ LANGUAGES = [
 ]
 
 _dll_dirs_added = False
+
+# How much of the previous dictation is handed over as context. The prompt
+# slot is 224 tokens and the vocabulary shares it.
+CONTEXT_WORDS = 60
 
 
 def ensure_cuda_dlls() -> None:
@@ -160,7 +166,16 @@ class Transcriber:
             log.debug("warm-up pass failed, ignoring")
 
     # -- transcription ----------------------------------------------------
-    def _initial_prompt(self) -> str | None:
+    def hotwords(self) -> str | None:
+        """The vocabulary, in the form the recogniser can actually use.
+
+        Whisper has no word list. What it has is a slot for "the text that came
+        before", and anything in that slot is more likely to be heard. An
+        initial prompt fills it for the first thirty-second window only, and a
+        dictation here regularly runs longer than that; hotwords fill it for
+        every window, so a name said in the second minute gets the same help as
+        one said in the first.
+        """
         terms = [t.strip() for t in self.config.get("asr.vocabulary", []) if t.strip()]
         if self.extra_vocabulary:
             try:
@@ -168,12 +183,38 @@ class Transcriber:
                 terms += [t for t in self.extra_vocabulary() if t.lower() not in seen]
             except Exception:
                 log.debug("could not read learned vocabulary", exc_info=True)
-        if not terms:
-            return None
-        # Whisper biases toward words seen in the prompt; a plain list is enough.
-        return "Vocabulary: " + ", ".join(terms) + "."
+        return ", ".join(terms) if terms else None
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def temperatures(self) -> list[float]:
+        """The decoding ladder.
+
+        A single temperature switches off the recogniser's own recovery: when
+        a window decodes into a degenerate loop or scores badly, faster-whisper
+        retries it warmer, but only if it has somewhere warmer to go. Two steps
+        up from the configured value are enough, and they cost nothing on a
+        take that decodes cleanly the first time.
+        """
+        base = max(0.0, min(1.0, float(self.config.get("asr.temperature", 0.0))))
+        return [min(1.0, base + step) for step in (0.0, 0.2, 0.4)]
+
+    @staticmethod
+    def context_prompt(previous: str, max_words: int = CONTEXT_WORDS) -> str | None:
+        """The tail of the last dictation, shaped as Whisper's "text before".
+
+        Whisper decodes each window as a continuation of whatever it is told
+        came before, which is how it keeps casing, spelling and punctuation
+        consistent across a long recording. Between two dictations a few
+        minutes apart the same trick applies: the names and jargon of the last
+        one are exactly what the next one is likely to contain. Kept short so
+        it leaves the decoder room for the actual speech.
+        """
+        words = " ".join(previous.split())
+        if not words:
+            return None
+        tail = words.split(" ")[-max_words:]
+        return " ".join(tail)
+
+    def transcribe(self, audio: np.ndarray, context: str | None = None) -> str:
         if audio.size == 0:
             return ""
         if not self.load():
@@ -187,7 +228,7 @@ class Transcriber:
                     audio,
                     language=language,
                     beam_size=max(1, int(cfg.get("asr.beam_size", 5))),
-                    temperature=float(cfg.get("asr.temperature", 0.0)),
+                    temperature=self.temperatures(),
                     vad_filter=bool(cfg.get("asr.vad_filter", True)),
                     vad_parameters={
                         "min_silence_duration_ms": int(cfg.get("asr.vad_min_silence_ms", 500))
@@ -195,10 +236,14 @@ class Transcriber:
                     condition_on_previous_text=bool(
                         cfg.get("asr.condition_on_previous_text", False)
                     ),
-                    initial_prompt=self._initial_prompt(),
+                    initial_prompt=context or None,
+                    hotwords=self.hotwords(),
                     word_timestamps=False,
                 )
                 text = "".join(segment.text for segment in segments)
             finally:
                 self.status = "ready" if self._model is not None else "idle"
-        return text.strip()
+        text, loops = collapse_loops(text.strip())
+        if loops:
+            log.info("folded %d phrase(s) the recogniser got stuck repeating", loops)
+        return text

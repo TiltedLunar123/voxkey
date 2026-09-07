@@ -6,7 +6,9 @@ import ctypes
 import logging
 import threading
 import time
-from ctypes import wintypes
+from ctypes import POINTER, byref, c_int, c_void_p, wintypes
+
+from . import com
 
 log = logging.getLogger("voxkey.inject")
 
@@ -294,6 +296,112 @@ def deliver(text: str, config) -> tuple[bool, str]:
     except Exception as exc:
         log.exception("delivery failed")
         return False, str(exc)
+
+
+# -- is there anywhere for a paste to land? --------------------------------
+# Ctrl+V into a list, a button or the desktop goes nowhere, and the clipboard
+# is then quietly handed back, so the dictation simply vanishes. UI Automation
+# can say what has keyboard focus, and when that is plainly not a text box the
+# text is left on the clipboard and the user is told why.
+CLSID_CUIAutomation = com.GUID.of("ff48dba4-60ef-4201-aa87-54103eef594e")
+IID_IUIAutomation = com.GUID.of("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee")
+_UIA_GET_FOCUSED = 8
+_ELEMENT_GET_PATTERN, _ELEMENT_CONTROL_TYPE = 16, 21
+_VALUE_PATTERN_ID, _VALUE_IS_READONLY = 10002, 5
+
+# UIA control types that cannot take typed text, with how to name them.
+NON_TEXT_TYPES = {
+    50000: "a button", 50001: "a calendar", 50002: "a checkbox", 50005: "a link",
+    50006: "an image", 50007: "a list item", 50008: "a list", 50009: "a menu",
+    50010: "a menu bar", 50011: "a menu item", 50012: "a progress bar",
+    50013: "a radio button", 50014: "a scroll bar", 50015: "a slider",
+    50016: "a spinner", 50017: "a status bar", 50018: "a tab strip", 50019: "a tab",
+    50021: "a toolbar", 50022: "a tooltip", 50023: "a tree", 50024: "a tree item",
+    50028: "a grid", 50029: "a grid cell", 50031: "a split button", 50034: "a header",
+    50035: "a header item", 50036: "a table", 50037: "a title bar",
+    50038: "a separator", 50040: "an app bar",
+}
+TEXT_TYPE, DOCUMENT_TYPE, WINDOW_TYPE = 50020, 50030, 50032
+
+# Terminals draw their own text and describe themselves to UIA in ways that
+# vary by build, and Ctrl+V works in every one of them. Never second-guess.
+TERMINALS = {
+    "windowsterminal", "openconsole", "conhost", "cmd", "powershell", "pwsh", "mintty",
+    "alacritty", "wezterm-gui", "hyper", "putty", "kitty", "tabby", "warp",
+}
+
+
+def _value_readonly(element: c_void_p) -> bool | None:
+    """True or False if the control exposes a value, None if it has none."""
+    pattern = c_void_p()
+    com.call(
+        element, _ELEMENT_GET_PATTERN, _VALUE_PATTERN_ID, byref(pattern),
+        argtypes=(c_int, POINTER(c_void_p)),
+    )
+    if not pattern:
+        return None
+    try:
+        readonly = c_int()
+        com.call(pattern, _VALUE_IS_READONLY, byref(readonly), argtypes=(POINTER(c_int),))
+        return bool(readonly.value)
+    finally:
+        com.release(pattern)
+
+
+def focused_text_field(app: str = "") -> tuple[str, str]:
+    """Where would a paste land right now?
+
+    Returns ("text", "") when the focused control takes typed text, or when
+    nobody can tell, and ("none", "a list item") when it plainly does not. Only
+    a definite "none" ever stops a paste; the benefit of the doubt goes to
+    pasting, which is what always happened before.
+    """
+    if app.lower() in TERMINALS:
+        return "text", ""
+    try:
+        # A UIA client belongs on a worker thread in the multithreaded
+        # apartment, which is exactly where this runs.
+        com.initialize(multithreaded=True)
+        automation = com.create(CLSID_CUIAutomation, IID_IUIAutomation)
+    except OSError:
+        return "unknown", ""
+    try:
+        verdict = _read_focus(automation)
+        # A Chromium app switches its accessibility tree on the first time
+        # anyone asks, and answers that first question with the bare minimum:
+        # a page with no patterns on it. Ask again once it is awake.
+        if verdict == ("text", "page"):
+            time.sleep(0.05)
+            verdict = _read_focus(automation)
+        return (verdict[0], "") if verdict[1] == "page" else verdict
+    except OSError:
+        return "unknown", ""
+    finally:
+        com.release(automation)
+
+
+def _read_focus(automation: c_void_p) -> tuple[str, str]:
+    element = c_void_p()
+    com.call(automation, _UIA_GET_FOCUSED, byref(element), argtypes=(POINTER(c_void_p),))
+    if not element:
+        return "unknown", ""
+    try:
+        kind = c_int()
+        com.call(element, _ELEMENT_CONTROL_TYPE, byref(kind), argtypes=(POINTER(c_int),))
+        if kind.value in NON_TEXT_TYPES:
+            return "none", NON_TEXT_TYPES[kind.value]
+        readonly = _value_readonly(element)
+        if kind.value == TEXT_TYPE and readonly is None:
+            return "none", "a piece of plain text"
+        if kind.value in (DOCUMENT_TYPE, WINDOW_TYPE):
+            # A browser with nothing focused reports the page itself, read-only.
+            if readonly is True:
+                return "none", "a page with no box selected"
+            if readonly is None:
+                return "text", "page"
+        return "text", ""
+    finally:
+        com.release(element)
 
 
 # -- reading what is already on screen ------------------------------------

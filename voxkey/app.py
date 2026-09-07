@@ -31,6 +31,10 @@ HALLUCINATIONS = {
 }
 
 
+# The previous dictation stops being useful context after this long.
+CONTEXT_FRESH_S = 10 * 60
+
+
 def _is_hallucination(text: str, seconds: float) -> bool:
     """Only ever true for very short clips; long ones are real speech."""
     return seconds < 3.0 and text.strip().lower() in HALLUCINATIONS
@@ -92,6 +96,7 @@ class Engine(QObject):
 
         self.hotkey = self._new_listener()
         self._blocked_for = 0
+        self._stuck_for = 0
         self._mic_warned = False
         self._watchdog = QTimer(self)
         self._watchdog.timeout.connect(self._check_health)
@@ -146,22 +151,28 @@ class Engine(QObject):
 
         # A modifier latched down by Windows stops the chord matching for as
         # long as it stays stuck, which looks exactly like the app being broken.
+        # An ordinary key held down is a different thing: that is someone
+        # walking forward in a game or leaning on an arrow key, and a toast in
+        # the middle of it helps nobody. An evening of W, A, S, D and Space
+        # each "stuck" for ten seconds produced eighteen of them. It goes in
+        # the log and on the Diagnostics tab, and the chord simply waits.
         blocked = self.hotkey.blocked_by()
         stuck = self.hotkey.stuck_key()
-        self._blocked_for = self._blocked_for + 1 if (blocked or stuck) else 0
+        self._blocked_for = self._blocked_for + 1 if blocked else 0
+        self._stuck_for = self._stuck_for + 1 if stuck else 0
         if self._blocked_for == 2:
-            if blocked:
-                detail = (f"Windows still reports {blocked.capitalize()} as held down, so "
-                          f"the chord cannot match. Tap and release {blocked.capitalize()}.")
-                short = f"{blocked.capitalize()} is stuck down"
-            else:
-                detail = (f"A key (virtual code 0x{stuck:02X}) has been reported held for "
-                          "ten seconds, which cancels every dictation. Tap it to clear it.")
-                short = f"Key 0x{stuck:02X} is stuck down"
+            detail = (f"Windows still reports {blocked.capitalize()} as held down, so "
+                      f"the chord cannot match. Tap and release {blocked.capitalize()}.")
+            short = f"{blocked.capitalize()} is stuck down"
             log.warning("hotkey blocked: %s", short)
             self.notice.emit("Hotkey is blocked", detail)
             self.ready_changed.emit(short)
-        elif self._blocked_for == 0 and self.transcriber.is_loaded():
+        elif self._stuck_for == 2:
+            log.info(
+                "key 0x%02X has been held for ten seconds; dictations cancel until it is released",
+                stuck,
+            )
+        elif self._blocked_for == 0 and self._stuck_for == 0 and self.transcriber.is_loaded():
             self.ready_changed.emit(f"Ready ({self.transcriber.last_device})")
 
     # -- lifecycle --------------------------------------------------------
@@ -180,6 +191,11 @@ class Engine(QObject):
                 )
         if self.config.get("asr.preload_on_start", True):
             threading.Thread(target=self._preload, daemon=True, name="voxkey-preload").start()
+        # Loading the UI Automation client costs a few tens of milliseconds
+        # the first time. Pay it now rather than on the first paste.
+        threading.Thread(
+            target=inject.focused_text_field, args=("",), daemon=True, name="voxkey-uia-warm"
+        ).start()
 
     def _preload(self) -> None:
         self.ready_changed.emit("Loading speech model...")
@@ -338,10 +354,26 @@ class Engine(QObject):
         ).start()
 
     # -- worker -----------------------------------------------------------
+    def _context_for(self, elapsed: float) -> str | None:
+        """The previous dictation, if it is recent enough to still be relevant.
+
+        Skipped for very short takes: a two-word take with a paragraph of
+        context in front of it is the shape that tempts Whisper into
+        transcribing the context instead of the audio.
+        """
+        if not self.config.get("asr.use_context", True) or elapsed < 2.0:
+            return None
+        if not self.history.entries:
+            return None
+        newest = self.history.entries[0]
+        if time.time() - newest.at > CONTEXT_FRESH_S:
+            return None
+        return self.transcriber.context_prompt(newest.text)
+
     def _process(self, clip, elapsed: float, profile: str) -> None:
         try:
             clip = audio_mod.normalise(clip, float(self.config.get("audio.gain", 1.0)))
-            raw = self.transcriber.transcribe(clip)
+            raw = self.transcriber.transcribe(clip, self._context_for(elapsed))
             if _is_hallucination(raw, elapsed):
                 log.info("discarded a likely hallucination: %r", raw)
                 raw = ""
@@ -357,14 +389,35 @@ class Engine(QObject):
                 self._finish_ui("cancelled", "Nothing heard", 900)
                 return
 
-            ok, detail = inject.deliver(text, self.config)
             entry = Entry(text=text, raw=raw, profile=profile, seconds=elapsed)
             self.history.add(entry)
             self.learner.observe_text(text)
             self.dictation_done.emit(entry)
-
             if result.warning:
                 self.notice.emit("Cleanup fell back", result.warning)
+
+            # Look before pasting. Ctrl+V into a list or a button goes nowhere
+            # and the clipboard is handed back afterwards, so the words would
+            # simply be gone.
+            if (
+                self.config.get("output.require_text_field", True)
+                and self.config.get("output.method", "paste") != "clipboard_only"
+            ):
+                app, _title = context_mod.foreground_window()
+                where, what = inject.focused_text_field(app)
+                if where == "none":
+                    inject.set_clipboard_text(text)
+                    log.info("copied instead of pasting: the focus was on %s", what)
+                    self._finish_ui("copied", "Copied, no text box", 2200)
+                    self.notice.emit(
+                        "Copied, not pasted",
+                        f"Nothing was pasted because the focus was on {what}, not a "
+                        "text box. Your words are on the clipboard: click where you "
+                        "want them and press Ctrl+V.",
+                    )
+                    return
+
+            ok, detail = inject.deliver(text, self.config)
             if ok:
                 self._finish_ui("done", detail.capitalize(), 900)
             else:

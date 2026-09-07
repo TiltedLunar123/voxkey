@@ -18,7 +18,9 @@ def launcher_command() -> str:
 
     pythonw.exe rather than python.exe, so logging in does not flash a console
     window; the .pyw launcher fixes up sys.path so the package is importable
-    without a working directory.
+    without a working directory. The --autostart flag is how the app knows
+    nobody asked for it, so it stays in the tray; a launch without the flag,
+    from the Start menu or a double-click, opens the window.
     """
     project = Path(__file__).resolve().parent.parent
     launcher = project / "VoxKey.pyw"
@@ -26,7 +28,7 @@ def launcher_command() -> str:
     windowed = interpreter.with_name("pythonw.exe")
     if windowed.exists():
         interpreter = windowed
-    return f'"{interpreter}" "{launcher}"'
+    return f'"{interpreter}" "{launcher}" --autostart'
 
 
 def is_enabled() -> bool:

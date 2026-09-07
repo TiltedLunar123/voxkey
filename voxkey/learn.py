@@ -83,6 +83,13 @@ class Learner:
             self.app_profiles = raw.get("app_profiles", {})
         except (OSError, ValueError, AttributeError):
             self.terms, self.app_profiles = {}, {}
+        # Earlier builds stored "again." and "time." with their full stops on,
+        # and they sat in the Smart tab for good. Anything the current rules
+        # would not learn today is dropped on the way in.
+        self.terms = {
+            term: data for term, data in self.terms.items()
+            if term == term.rstrip(TRAILING) and _distinctive(term, first_in_sentence=False)
+        }
 
     def save(self) -> None:
         try:
