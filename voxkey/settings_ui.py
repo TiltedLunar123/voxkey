@@ -72,7 +72,8 @@ QScrollArea { border: none; }
 MODIFIERS = [("Ctrl", "ctrl"), ("Alt", "alt"), ("Shift", "shift"), ("Win", "win")]
 
 _DIAG_LABELS = {
-    "listener": "Key listener", "chord": "Talk chord", "blocked": "Blocked by",
+    "listener": "Key listener", "chord": "Talk chord", "chords": "Other chords",
+    "blocked": "Blocked by",
     "device": "Input device", "stream": "Audio stream", "level": "Live level",
     "speech": "State", "speech_device": "Model", "ollama": "Ollama",
     "llm_model": "Model", "guard": "Last rewrite", "last": "Most recent",
@@ -302,6 +303,7 @@ class SettingsWindow(QMainWindow):
         default_layout.addWidget(self._default_profile)
         layout.addWidget(default_box)
         layout.addWidget(self._fix_box())
+        layout.addWidget(self._paraphrase_box())
         layout.addStretch(1)
         return page
 
@@ -1849,6 +1851,87 @@ class SettingsWindow(QMainWindow):
         self._fix_warning.setStyleSheet("color:#f0b360;" if message else "")
         self._fix_warning.setVisible(bool(message))
 
+    # -- Paraphrase chord --------------------------------------------------
+    def _paraphrase_box(self) -> QGroupBox:
+        box = QGroupBox("Reword what is selected")
+        layout = QVBoxLayout(box)
+        layout.addWidget(hint(
+            "Select some text, press this chord, and VoxKey puts the same thing back "
+            "in different words. Names, numbers, dates, file paths and addresses are "
+            "kept exactly as they are; a result that drops one is thrown away rather "
+            "than pasted."
+        ))
+        layout.addWidget(self.check("Enable the paraphrase chord", "paraphrase.enabled"))
+
+        row = QHBoxLayout()
+        self._para_mods: dict[str, QCheckBox] = {}
+        active = [m.lower() for m in self.config.get("paraphrase.modifiers", [])]
+        for label, value in MODIFIERS:
+            item = QCheckBox(label)
+            item.setChecked(value in active)
+            item.toggled.connect(self._paraphrase_chord_changed)
+            self._para_mods[value] = item
+            row.addWidget(item)
+        row.addSpacing(10)
+        row.addWidget(QLabel("plus key:"))
+        self._para_key = QComboBox()
+        self._para_key.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._para_key.setMinimumContentsLength(12)
+        self._para_key.addItem("(none)", "")
+        for name in sorted(KEY_VKS):
+            self._para_key.addItem(name.upper() if len(name) == 1 else name, name)
+        found = self._para_key.findData((self.config.get("paraphrase.key") or "").lower())
+        self._para_key.setCurrentIndex(max(0, found))
+        self._para_key.currentIndexChanged.connect(self._paraphrase_chord_changed)
+        row.addWidget(self._para_key)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._para_preview = QLabel()
+        self._para_preview.setStyleSheet("color:#7dd3c0; font-size:15px; font-weight:600;")
+        layout.addWidget(self._para_preview)
+        self._para_warning = hint("")
+        layout.addWidget(self._para_warning)
+
+        form = QFormLayout()
+        form.addRow("Stop after", self.spin("paraphrase.max_chars", 200, 100000, " characters", 500))
+        layout.addLayout(form)
+        layout.addWidget(hint(
+            "Selection only, on purpose. Reaching for Ctrl+A here would reword a "
+            "whole document because you wanted one sentence changed. Nothing happens "
+            "if there is no selection."
+        ))
+        self._refresh_paraphrase_preview()
+        return box
+
+    def _paraphrase_chord_changed(self) -> None:
+        modifiers = [value for value, box in self._para_mods.items() if box.isChecked()]
+        self.config.set("paraphrase.modifiers", modifiers)
+        self.config.set("paraphrase.key", self._para_key.currentData() or "")
+        self.config.save()
+        self._refresh_paraphrase_preview()
+
+    def _refresh_paraphrase_preview(self) -> None:
+        modifiers = [v for v, b in self._para_mods.items() if b.isChecked()]
+        key = self._para_key.currentData() or ""
+        self._para_preview.setText(key_label(modifiers, key))
+
+        message = ""
+        mine = (frozenset(modifiers), key)
+        talk = (frozenset(m.lower() for m in self.config.get("hotkey.modifiers", [])),
+                (self.config.get("hotkey.key") or "").lower())
+        fix = (frozenset(m.lower() for m in self.config.get("fix.modifiers", [])),
+               (self.config.get("fix.key") or "").lower())
+        if not modifiers and not key:
+            message = "Nothing is bound, so the paraphrase chord can never fire."
+        elif mine == talk:
+            message = "This is the same as the talk chord. One of them will never fire."
+        elif mine == fix:
+            message = "This is the same as the fix chord. One of them will never fire."
+        self._para_warning.setText(message)
+        self._para_warning.setStyleSheet("color:#f0b360;" if message else "")
+        self._para_warning.setVisible(bool(message))
+
     # -- Diagnostics ------------------------------------------------------
     def _tab_diagnostics(self) -> QWidget:
         page = QWidget()
@@ -1863,7 +1946,7 @@ class SettingsWindow(QMainWindow):
 
         self._diag_rows: dict[str, QLabel] = {}
         for section, keys in (
-            ("Hotkey", ["listener", "chord", "blocked"]),
+            ("Hotkey", ["listener", "chord", "chords", "blocked"]),
             ("Microphone", ["device", "stream", "level"]),
             ("Speech model", ["speech", "speech_device"]),
             ("Rewriter", ["ollama", "llm_model", "guard"]),
@@ -1960,6 +2043,11 @@ class SettingsWindow(QMainWindow):
             "listener": "running" if hotkey.is_alive() else "NOT RUNNING",
             "chord": key_label(
                 self.config.get("hotkey.modifiers", []), self.config.get("hotkey.key", "")
+            ),
+            "chords": "   ".join(
+                f"{name}: {key_label(self.config.get(f'{section}.modifiers', []), self.config.get(f'{section}.key', ''))}"
+                + ("" if self.config.get(f"{section}.enabled", True) else " (off)")
+                for name, section in (("Fix", "fix"), ("Reword", "paraphrase"))
             ),
             "blocked": blocked,
             "device": device_name,

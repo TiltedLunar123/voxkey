@@ -94,6 +94,7 @@ class HotkeyListener(threading.Thread):
         on_cancel: Callable[[], None],
         on_arm: Callable[[], None] | None = None,
         on_fix: Callable[[], None] | None = None,
+        on_paraphrase: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(daemon=True, name="voxkey-hotkey")
         self.config = config
@@ -104,9 +105,14 @@ class HotkeyListener(threading.Thread):
         # the microphone is already open by the time recording counts. Without
         # it the first word is lost to the threshold plus stream start-up.
         self.on_arm = on_arm
-        # The fix chord is a tap, not a hold, so it fires once on the edge.
+        # The fix and paraphrase chords are taps, not holds, so each fires once
+        # on the edge and then waits for its chord to be released.
         self.on_fix = on_fix
-        self._fix_fired = False
+        self.on_paraphrase = on_paraphrase
+        # The tap chord currently held down, and whether another key joined it
+        # and turned the whole thing into somebody else's shortcut.
+        self._tap_armed: tuple[str, Callable[[], None]] | None = None
+        self._tap_spoiled = False
         self._armed = False
         self._stop_event = threading.Event()
         self._paused = threading.Event()
@@ -140,13 +146,28 @@ class HotkeyListener(threading.Thread):
             bool(hk.get("cancel_on_other_key", True)),
         )
 
-    def _fix_binding(self) -> tuple[list[str], str, bool]:
-        fix = self.config.get("fix", {})
-        return (
-            [m.lower() for m in fix.get("modifiers", [])],
-            (fix.get("key") or "").lower(),
-            bool(fix.get("enabled", True)) and bool(self.on_fix),
-        )
+    def _tap_bindings(self) -> list[tuple[str, list[str], str, Callable[[], None]]]:
+        """The chords that fire once on the edge rather than being held.
+
+        Longest chord first. Two tap chords can never both match at once,
+        because _chord_held insists every modifier outside the binding is up,
+        but the order still decides which one is tested against a chord that
+        is only part way down.
+        """
+        out = []
+        for name, section, handler in (
+            ("fix", "fix", self.on_fix),
+            ("paraphrase", "paraphrase", self.on_paraphrase),
+        ):
+            settings = self.config.get(section, {})
+            if not handler or not settings.get("enabled", True):
+                continue
+            modifiers = [m.lower() for m in settings.get("modifiers", [])]
+            key = (settings.get("key") or "").lower()
+            if modifiers or key:
+                out.append((name, modifiers, key, handler))
+        out.sort(key=lambda item: len(item[1]) + (1 if item[2] else 0), reverse=True)
+        return out
 
     def _chord_vks(self, modifiers: list[str], key: str) -> set[int]:
         vks: set[int] = set()
@@ -224,22 +245,49 @@ class HotkeyListener(threading.Thread):
             if self._active or self._armed:
                 self._active = self._armed = False
                 self.on_cancel()
+            # A chord held while the listener was paused must not fire the
+            # moment it is released, which is what recording a new binding in
+            # Settings looks like from here.
+            self._tap_armed = None
+            self._tap_spoiled = False
             held_since = None
             return held_since
 
-        # The fix chord is a superset of the talk chord, so it has to be
+        # The tap chords are supersets of the talk chord, so they have to be
         # tested first or the talk chord would see a stray release.
-        fix_modifiers, fix_key, fix_on = self._fix_binding()
-        if fix_on and self._chord_held(fix_modifiers, fix_key):
-            if not self._fix_fired:
-                self._fix_fired = True
+        #
+        # They fire on release, not on press. Ctrl+Alt+Shift is the front half
+        # of a great many real shortcuts, and firing the moment the modifiers
+        # are down would reword the selection every time somebody reached for
+        # Ctrl+Alt+Shift+S in their editor. Waiting for the release costs
+        # nothing a person would notice and gives the fourth key time to
+        # arrive, at which point the tap is abandoned.
+        held_tap: tuple[str, Callable[[], None]] | None = None
+        for name, modifiers, key, handler in self._tap_bindings():
+            if self._chord_held(modifiers, key):
+                held_tap = (name, handler)
+                chord_vks = self._chord_vks(modifiers, key)
+                if self._foreign_key_down(chord_vks, key):
+                    self._tap_spoiled = True
+                break
+
+        if held_tap is not None:
+            if self._tap_armed is None or self._tap_armed[0] != held_tap[0]:
+                self._tap_armed = held_tap
+                self._tap_spoiled = False
                 if self._active or self._armed:
                     self._active = self._armed = False
                     self.on_cancel()
-                self.on_fix()
-            held_since = None
-            return held_since
-        self._fix_fired = False
+            return None
+
+        if self._tap_armed is not None:
+            _name, handler = self._tap_armed
+            spoiled = self._tap_spoiled
+            self._tap_armed = None
+            self._tap_spoiled = False
+            if not spoiled:
+                handler()
+                return None
 
         modifiers, key, mode, threshold, cancel_on_other = self._binding()
         chord_vks = self._chord_vks(modifiers, key)

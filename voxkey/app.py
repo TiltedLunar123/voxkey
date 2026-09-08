@@ -14,7 +14,7 @@ from . import inject
 from .asr import Transcriber
 from .learn import Learner
 from .cleanup import CleanupPipeline
-from .cleanup.pipeline import fix_text
+from .cleanup.pipeline import fix_text, paraphrase_text
 from .config import Config
 from .history import Entry, History
 from .hotkey import HotkeyListener
@@ -35,9 +35,32 @@ HALLUCINATIONS = {
 CONTEXT_FRESH_S = 10 * 60
 
 
-def _is_hallucination(text: str, seconds: float) -> bool:
-    """Only ever true for very short clips; long ones are real speech."""
-    return seconds < 3.0 and text.strip().lower() in HALLUCINATIONS
+def _is_hallucination(text: str, seconds: float, confidence=None) -> bool:
+    """Did the recogniser invent this, rather than hear it?
+
+    Two independent tests. The phrase list catches what a short clip of room
+    tone reliably decodes to in English, and stays because it is certain. The
+    confidence check catches the same thing in general: a short take the
+    recogniser scored as probably-not-speech and was unsure of the words for
+    is not something to paste into somebody's document. Anything past a few
+    seconds is left alone either way, because a long take is real speech even
+    when it scores badly.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if seconds < 3.0 and stripped.lower() in HALLUCINATIONS:
+        return True
+    if confidence is None or seconds >= 3.0:
+        return False
+    # Short, unsure, and scored as silence: three signals that only line up
+    # together on a clip where nobody said anything.
+    return (
+        confidence.kept > 0
+        and not confidence.certain
+        and confidence.no_speech > 0.5
+        and len(stripped.split()) <= 4
+    )
 
 
 class Engine(QObject):
@@ -47,6 +70,7 @@ class Engine(QObject):
     _cancel_requested = Signal()
     _arm_requested = Signal()
     _fix_requested = Signal()
+    _paraphrase_requested = Signal()
 
     state_changed = Signal(str, str)      # state, detail
     dictation_done = Signal(object)       # history.Entry
@@ -81,6 +105,7 @@ class Engine(QObject):
         self._cancel_requested.connect(self._cancel)
         self._arm_requested.connect(self._arm)
         self._fix_requested.connect(self._fix)
+        self._paraphrase_requested.connect(self._paraphrase)
         self._overlay_state.connect(self.overlay.set_state)
         self._overlay_finish.connect(self.overlay.finish)
 
@@ -109,6 +134,7 @@ class Engine(QObject):
             on_cancel=self._cancel_requested.emit,
             on_arm=self._arm_requested.emit,
             on_fix=self._fix_requested.emit,
+            on_paraphrase=self._paraphrase_requested.emit,
         )
 
     def _check_health(self) -> None:
@@ -374,7 +400,7 @@ class Engine(QObject):
         try:
             clip = audio_mod.normalise(clip, float(self.config.get("audio.gain", 1.0)))
             raw = self.transcriber.transcribe(clip, self._context_for(elapsed))
-            if _is_hallucination(raw, elapsed):
+            if _is_hallucination(raw, elapsed, self.transcriber.last_confidence):
                 log.info("discarded a likely hallucination: %r", raw)
                 raw = ""
             if not raw.strip():
@@ -437,33 +463,72 @@ class Engine(QObject):
         self._overlay_finish.emit(state, detail, linger)
         self.state_changed.emit("idle", "")
 
-    # -- fix what is already in the box ------------------------------------
+    # -- act on text that is already in the box ----------------------------
     def _fix(self) -> None:
+        self._start_rewrite("fix")
+
+    def _paraphrase(self) -> None:
+        self._start_rewrite("paraphrase")
+
+    def _start_rewrite(self, section: str) -> None:
         if self.busy or self.recorder.recording:
             return
         self.busy = True
-        threading.Thread(target=self._do_fix, daemon=True, name="voxkey-fix").start()
+        threading.Thread(
+            target=self._do_rewrite, args=(section,),
+            daemon=True, name=f"voxkey-{section}",
+        ).start()
 
-    def _do_fix(self) -> None:
+    # Everything the two chords say differently, in one place.
+    _WORDING = {
+        "fix": {
+            "working": "Fixing", "nothing": "Nothing to fix", "failed": "Fix failed",
+            "done": "Fixed", "title": "Grammar fix failed", "partial": "Only part was fixed",
+            "unchanged": "Already fine", "scope": None,
+        },
+        "paraphrase": {
+            "working": "Rewording", "nothing": "Nothing selected", "failed": "Rewording failed",
+            "done": "Reworded", "title": "Paraphrase failed", "partial": "Only part was reworded",
+            "unchanged": "", "scope": "selection",
+        },
+    }
+
+    def _do_rewrite(self, section: str) -> None:
+        words = self._WORDING[section]
         try:
             self._overlay_state.emit("rewriting", "Reading")
             self.state_changed.emit("rewriting", "")
-            original, why, hwnd = inject.grab_text(self.config)
+            original, why, hwnd = inject.grab_text(self.config, words["scope"])
             if original is None:
-                self._finish_ui("cancelled", "Nothing to fix", 1300)
-                self.notice.emit("Nothing to fix", why[:1].upper() + why[1:] + ".")
+                self._finish_ui("cancelled", words["nothing"], 1300)
+                self.notice.emit(words["nothing"], why[:1].upper() + why[1:] + ".")
                 return
 
-            self._overlay_state.emit("rewriting", "Fixing")
-            result = fix_text(
+            self._overlay_state.emit("rewriting", words["working"])
+            run = fix_text if section == "fix" else paraphrase_text
+            result = run(
                 self.pipeline, original,
                 lambda message: self._overlay_state.emit("rewriting", message),
             )
             if not result.text.strip():
-                self._finish_ui("error", "Fix failed", 2000)
+                self._finish_ui("error", words["failed"], 2000)
                 return
             if result.text.strip() == original.strip():
-                self._finish_ui("done", "Already fine", 1300)
+                if result.guard == "unavailable":
+                    # Nothing changed because the model never answered, which is
+                    # not the same as the text being fine.
+                    self._finish_ui("error", "Model offline", 2200)
+                    self.notice.emit("The rewrite model is not running", result.warning or "")
+                elif words["unchanged"]:
+                    self._finish_ui("done", words["unchanged"], 1300)
+                else:
+                    # A paraphrase that comes back identical has not done its
+                    # job, and saying "already fine" would imply it had.
+                    self._finish_ui("error", "No change", 1800)
+                    self.notice.emit(
+                        "Nothing was reworded",
+                        "The model handed back the same wording. Try a longer selection.",
+                    )
                 return
 
             ok, detail = inject.replace_selection(result.text, self.config, hwnd)
@@ -472,16 +537,16 @@ class Engine(QObject):
             ))
             self.learner.observe_text(result.text)
             if result.warning:
-                self.notice.emit("Only part was fixed", result.warning)
+                self.notice.emit(words["partial"], result.warning)
             if ok:
-                self._finish_ui("done", "Fixed", 1100)
+                self._finish_ui("done", words["done"], 1100)
             else:
                 self._finish_ui("error", "Not replaced", 2200)
                 self.notice.emit("Could not replace the text", detail)
         except Exception as exc:
-            log.exception("grammar fix failed")
-            self._finish_ui("error", "Fix failed", 2200)
-            self.notice.emit("Grammar fix failed", str(exc))
+            log.exception("%s failed", section)
+            self._finish_ui("error", words["failed"], 2200)
+            self.notice.emit(words["title"], str(exc))
         finally:
             self.busy = False
 

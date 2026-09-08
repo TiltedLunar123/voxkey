@@ -7,6 +7,7 @@ import os
 import site
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,35 @@ _dll_dirs_added = False
 # How much of the previous dictation is handed over as context. The prompt
 # slot is 224 tokens and the vocabulary shares it.
 CONTEXT_WORDS = 60
+
+
+@dataclass
+class Confidence:
+    """What the recogniser thought of its own answer.
+
+    avg_logprob is the mean per-token log probability, so nearer zero is more
+    certain and anything below about -1 is the decoder guessing. no_speech is
+    its estimate that the window held no speech at all. Both are per segment
+    and both are averaged here weighted by how long each segment ran, so one
+    confident sentence is not outvoted by a half-second of noise after it.
+    """
+
+    avg_logprob: float = 0.0
+    no_speech: float = 0.0
+    dropped: int = 0
+    kept: int = 0
+
+    @property
+    def certain(self) -> bool:
+        return self.kept > 0 and self.avg_logprob > SEGMENT_LOGPROB and self.no_speech < SEGMENT_NO_SPEECH
+
+
+# A segment is thrown away only when the recogniser is both unsure of the words
+# and fairly sure nobody was speaking. Either signal on its own is too eager:
+# a quiet but clean sentence scores badly on no_speech, and an unusual name
+# scores badly on logprob while being exactly what the user said.
+SEGMENT_NO_SPEECH = 0.6
+SEGMENT_LOGPROB = -1.0
 
 
 def ensure_cuda_dlls() -> None:
@@ -88,6 +118,9 @@ class Transcriber:
         self.status = "idle"
         self.last_error: str | None = None
         self.last_device: str = "-"
+        # What the recogniser made of the most recent take, for the caller's
+        # hallucination check and for Diagnostics.
+        self.last_confidence = Confidence()
 
     # -- model management -------------------------------------------------
     def _resolve(self) -> tuple[str, str, str]:
@@ -214,6 +247,25 @@ class Transcriber:
         tail = words.split(" ")[-max_words:]
         return " ".join(tail)
 
+    @staticmethod
+    def _worth_keeping(segment, cfg) -> bool:
+        """Is this segment speech, by the recogniser's own reckoning?
+
+        Whisper answers every window with words whether or not there were any,
+        which is where "Thank you." on a second of room tone comes from. It
+        does say how sure it is, though, and that is a far better filter than
+        a list of the phrases it happens to favour in English: it needs no
+        upkeep, it covers the phrasings nobody thought to list, and it works
+        the same in any language.
+        """
+        if not bool(cfg.get("asr.drop_unsure_segments", True)):
+            return True
+        no_speech = float(getattr(segment, "no_speech_prob", 0.0) or 0.0)
+        logprob = float(getattr(segment, "avg_logprob", 0.0) or 0.0)
+        ceiling = float(cfg.get("asr.no_speech_threshold", SEGMENT_NO_SPEECH))
+        floor = float(cfg.get("asr.logprob_threshold", SEGMENT_LOGPROB))
+        return not (no_speech > ceiling and logprob < floor)
+
     def transcribe(self, audio: np.ndarray, context: str | None = None) -> str:
         if audio.size == 0:
             return ""
@@ -231,19 +283,70 @@ class Transcriber:
                     temperature=self.temperatures(),
                     vad_filter=bool(cfg.get("asr.vad_filter", True)),
                     vad_parameters={
-                        "min_silence_duration_ms": int(cfg.get("asr.vad_min_silence_ms", 500))
+                        "min_silence_duration_ms": int(cfg.get("asr.vad_min_silence_ms", 500)),
+                        # The gate trims to where speech was detected, and a
+                        # word that starts softly begins before that. Padding
+                        # both ends back out is what stops "okay" losing its o.
+                        "speech_pad_ms": int(cfg.get("asr.vad_speech_pad_ms", 200)),
                     },
                     condition_on_previous_text=bool(
                         cfg.get("asr.condition_on_previous_text", False)
+                    ),
+                    # The recogniser's own guards. Left at the library defaults
+                    # before, which meant a window that decoded into a loop or
+                    # into nothing was kept anyway.
+                    no_speech_threshold=float(
+                        cfg.get("asr.no_speech_threshold", SEGMENT_NO_SPEECH)
+                    ),
+                    log_prob_threshold=float(
+                        cfg.get("asr.logprob_threshold", SEGMENT_LOGPROB)
+                    ),
+                    compression_ratio_threshold=float(
+                        cfg.get("asr.compression_ratio_threshold", 2.4)
                     ),
                     initial_prompt=context or None,
                     hotwords=self.hotwords(),
                     word_timestamps=False,
                 )
-                text = "".join(segment.text for segment in segments)
+                kept, confidence = self._collect(segments, cfg)
+                text = "".join(kept)
+                self.last_confidence = confidence
             finally:
                 self.status = "ready" if self._model is not None else "idle"
+        if confidence.dropped:
+            log.info(
+                "dropped %d segment(s) the recogniser did not believe were speech",
+                confidence.dropped,
+            )
         text, loops = collapse_loops(text.strip())
         if loops:
             log.info("folded %d phrase(s) the recogniser got stuck repeating", loops)
         return text
+
+    def _collect(self, segments, cfg) -> tuple[list[str], Confidence]:
+        """Drain the generator, keeping the segments that look like speech."""
+        kept: list[str] = []
+        weight = 0.0
+        logprob_sum = 0.0
+        no_speech_sum = 0.0
+        confidence = Confidence()
+        for segment in segments:
+            if not self._worth_keeping(segment, cfg):
+                confidence.dropped += 1
+                log.debug(
+                    "dropped %r (no_speech %.2f, logprob %.2f)",
+                    segment.text.strip()[:40],
+                    getattr(segment, "no_speech_prob", 0.0),
+                    getattr(segment, "avg_logprob", 0.0),
+                )
+                continue
+            kept.append(segment.text)
+            confidence.kept += 1
+            span = max(0.1, float(getattr(segment, "end", 0.0) - getattr(segment, "start", 0.0)))
+            weight += span
+            logprob_sum += span * float(getattr(segment, "avg_logprob", 0.0) or 0.0)
+            no_speech_sum += span * float(getattr(segment, "no_speech_prob", 0.0) or 0.0)
+        if weight:
+            confidence.avg_logprob = logprob_sum / weight
+            confidence.no_speech = no_speech_sum / weight
+        return kept, confidence

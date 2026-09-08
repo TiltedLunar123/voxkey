@@ -3,6 +3,10 @@
 Hold **Ctrl + Win**, say something, let go. It gets transcribed, tidied up the
 way you asked, and typed into whatever window you were already in.
 
+Two more chords work on text that is already on screen. **Ctrl + Win + Alt**
+fixes the spelling and grammar of whatever is in the box. **Ctrl + Alt +
+Shift** takes what you have selected and says it again in different words.
+
 Everything runs on this machine. No audio and no text leaves the computer.
 
 Windows only. It needs a microphone, and a GPU if you want it fast.
@@ -277,6 +281,52 @@ Guards worth knowing about:
 Change the chord, or make it fix only the current selection instead of the whole
 box, on the Dictation tab.
 
+## Rewording what you selected
+
+Select some text, press **Ctrl + Alt + Shift**, and the same thing comes back
+said differently. Clauses move. Verbs change. Active turns passive. What never
+moves is a name or a number, and neither does a file path or an address.
+
+Selection only, and that is not an oversight. The grammar chord reaches for
+Ctrl+A when nothing is selected, which is the right call for fixing a typo in a
+box you just typed into. Here it would reword a whole document because somebody
+wanted one sentence changed. Nothing selected, nothing happens; the bar says so.
+
+The three chords cannot be mistaken for each other. A binding only matches when
+the modifiers outside it are up, and this one holds no Win key at all, so the
+three are mutually exclusive by construction rather than by luck.
+
+Both tap chords fire when you let go, not when the modifiers land.
+Ctrl+Alt+Shift is the front half of a lot of real shortcuts. Firing on press
+would reword your selection every time you reached for Ctrl+Alt+Shift+S in an
+editor. Waiting for the release gives the fourth key time to arrive, and when it
+turns up the tap is abandoned.
+
+Checking a paraphrase is a different job from checking a grammar fix. How do
+you count words that survived, when the whole point of this one is that they
+should not? So the check asks other things instead:
+
+- Every name in the original is still there. A paraphrase does not get to rename
+  a person or a product, and a renamed one is the kind of error a reader
+  skimming the result would never think to check.
+- Every number, unit, path, URL, address and code span came back character for
+  character. "We cut it to 400 ms" coming back as "the timeout is 400" reads
+  like a finished sentence. It is missing the only part that mattered.
+- It runs between roughly half and twice the original length, which refuses a
+  summary at one end and an essay at the other.
+- It is not simply the input again. Handed a short line, a model will often hand
+  it straight back. That is not a paraphrase. It is a round trip that cost you a
+  second and taught you the feature does not work.
+
+Anything that fails goes back through once more, hotter. If that fails too, the
+selection is left alone rather than replaced with something worse.
+
+Scored on twelve sentences covering work chatter, file paths, addresses and
+numbers: names and literals survive 12 out of 12, and the length stays sensible
+12 out of 12. It genuinely rephrases 11 of them rather than swapping one word.
+The twelfth is a sentence made almost entirely of proper nouns, where there is
+little left to reword once the names are held fixed.
+
 ## Catching the first word
 
 The microphone is held open and the last 0.6 seconds are kept in a rolling
@@ -431,6 +481,36 @@ Settings, history and the log live in `%APPDATA%\VoxKey`.
 `selftest.py` checks everything that does not need a microphone or a window,
 and puts your clipboard back when it is done. `tools\replay_history.py` needs
 Ollama and reads your history; it writes nothing.
+
+## Changes in 1.2.0
+
+- **Ctrl + Alt + Shift rewords the selection.** Every name and every number is
+  held fixed, and so is anything that looks like a path or an address. A result
+  that drops one is thrown away rather than pasted.
+- Both tap chords now fire on release, so a chord that grows a fourth key is
+  somebody else's shortcut and is left alone.
+- The rewrite no longer gets to damage a literal. Numbers, units, paths, URLs,
+  addresses and code spans are put back if the model altered them, found by a
+  benchmark run where "400 ms" came back as "40-0".
+- The check for a copied example stopped firing on correct work. It was
+  rejecting "the report was written by Sarah" for reusing the phrasing the
+  example exists to teach, and the slower retry was usually worse.
+- A rejected paragraph is retried a sentence at a time, so one bad clause no
+  longer costs the corrections in the other four.
+- Filler stripping asks whether the word is doing a job. "You know" and "like"
+  only come out where you paused around them, because cutting them everywhere
+  turned "looks exactly like a key" into "looks exactly a key" and "do you
+  know?" into "do?".
+- Spoken file names and paths are assembled: "pipeline dot py" becomes
+  `pipeline.py`, and a run of spoken slashes becomes a path.
+- A name the recogniser split in two is put back together, so "SecPlus
+  Mastery" becomes "SecPlusMastery".
+- Whisper's own confidence decides what was speech, instead of a list of the
+  phrases it likes to invent in English.
+- Grammar fix: 44 of 44 on a harder benchmark, up from 40.
+- Fixed: a grammar fix with Ollama down threw the selection away instead of
+  keeping the certain corrections, and reported "already fine" for text it had
+  never checked.
 
 ## Changes in 1.1.0
 
