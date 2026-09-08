@@ -172,6 +172,49 @@ PROFILES: dict[str, dict[str, Any]] = {
             "introduce an em dash or an en dash; use a comma, a full stop or a colon."
         ),
     },
+    "paraphrase": {
+        "label": "Paraphrase",
+        "blurb": "Says the same thing in different words. Keeps every name, number and fact.",
+        "llm": True,
+        # Deliberately about nothing this app gets used for. Examples drawn
+        # from work and software gave the model a head start on guessing the
+        # answer instead of doing the work, and the leak check kept catching
+        # real dictations for reusing their phrasing. Each pair moves the
+        # clauses around rather than swapping a word, because a single word
+        # substitution is exactly the failure they are here to prevent.
+        "examples": [
+            ("The kitchen tap has been dripping since Tuesday and the landlord still "
+             "has not called back.",
+             "Since Tuesday the kitchen tap has dripped, and there is still no word "
+             "from the landlord."),
+            ("We cancelled the trip because the forecast showed 40 mm of rain on Saturday.",
+             "Saturday's forecast of 40 mm of rain is why we called the trip off."),
+            ("Could you tell me whether the parcel arrived before noon?",
+             "Would you let me know if the parcel got here before midday?"),
+        ],
+        # Naming what must survive beats asking for a paraphrase and hoping.
+        # Told only to "reword it", a 4B model summarised: three sentences came
+        # back as one, and the missing two were not obviously missing. Told to
+        # use different words, it changed exactly one per sentence, which is
+        # why the structural instructions are spelled out one by one.
+        "prompt": (
+            "Rewrite the text so it says exactly the same thing in a different way. "
+            "Rebuild each sentence rather than swapping a word or two: change where "
+            "the sentence starts, reorder the clauses, switch between active and "
+            "passive, and turn phrases into single words or single words into "
+            "phrases. Nouns that name a specific thing stay; it is the verbs, the "
+            "connectives and the shape of the sentence that should change. "
+            "Keep every fact, every name, every number, every date and every "
+            "quantity precisely as they are. Keep the same number of sentences and "
+            "roughly the same length: this is a rewording, not a summary and not an "
+            "expansion. Keep the register of the original, so casual text stays "
+            "casual and formal text stays formal. Keep questions as questions and "
+            "instructions as instructions. Leave code, commands, file paths, URLs "
+            "and email addresses character for character as they are. The result "
+            "must be correct, natural English. Add nothing that was not there, and "
+            "remove nothing that was."
+        ),
+    },
     "custom": {
         "label": "Custom",
         "blurb": "Your own instruction, edited on the Cleanup tab.",
@@ -212,8 +255,18 @@ DEFAULTS: dict[str, Any] = {
         "beam_size": 5,
         "vad_filter": True,
         "vad_min_silence_ms": 500,
+        # Give the voice gate a moment either side of what it detected, so a
+        # word that starts or ends softly is not clipped off.
+        "vad_speech_pad_ms": 200,
         "temperature": 0.0,
         "condition_on_previous_text": False,
+        # Throw away a window the recogniser is both unsure of and fairly sure
+        # was not speech. This is what catches "Thank you." on room tone, and
+        # unlike a list of stock phrases it needs no upkeep.
+        "drop_unsure_segments": True,
+        "no_speech_threshold": 0.6,
+        "logprob_threshold": -1.0,
+        "compression_ratio_threshold": 2.4,
         "vocabulary": list(DEFAULT_VOCABULARY),
         "preload_on_start": True,
         # Hand the recogniser the end of the previous dictation as context, so
@@ -246,6 +299,9 @@ DEFAULTS: dict[str, Any] = {
         # "Nectar" becomes "Nekter" when Nekter is in the vocabulary and the
         # recogniser capitalised what it heard.
         "snap_vocabulary": True,
+        # "pipeline dot py" becomes pipeline.py, and a run of spoken slashes
+        # becomes a path. Only real extensions and domains are joined.
+        "spoken_paths": True,
         "capitalize_sentences": True,
         "ensure_final_punctuation": True,
         "strip_trailing_period_short": True,
@@ -276,6 +332,14 @@ DEFAULTS: dict[str, Any] = {
         # Check every rewrite for copied examples and dropped content, retry
         # once without examples, and fall back to the rules if it is still off.
         "fidelity_guard": True,
+        # Put back any number, path, URL, address or code span the rewrite
+        # altered. A wrong port or file name is not something the reader can
+        # spot afterwards, and the model does occasionally get one wrong.
+        "protect_literals": True,
+        # When a whole chunk is rejected, rewrite it a sentence at a time and
+        # keep the ones that check out, instead of losing every correction in
+        # the paragraph over one clause.
+        "salvage_by_sentence": True,
     },
     "output": {
         "method": "paste",
@@ -319,6 +383,19 @@ DEFAULTS: dict[str, Any] = {
         # Apply the certain corrections (missing apostrophes, "could of",
         # subject-case pronouns) by rule before the model runs.
         "deterministic_pass": True,
+    },
+    "paraphrase": {
+        # A third chord that rewords whatever is selected. Ctrl+Alt+Shift is
+        # free on this machine and, unlike the other two, holds no Win key, so
+        # the three chords can never be mistaken for one another.
+        "enabled": True,
+        "modifiers": ["ctrl", "alt", "shift"],
+        "key": "",
+        # Selection only. Reaching for Ctrl+A here would reword a whole
+        # document because somebody wanted one sentence changed.
+        "scope": "selection",
+        "profile": "paraphrase",
+        "max_chars": 6000,
     },
     "context": {
         # Follow the window you are dictating into instead of one fixed profile.

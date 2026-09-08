@@ -366,6 +366,70 @@ def _run() -> int:
     check("talk chord suppressed while fix chord is held", not fake(["ctrl", "win"], ""))
     check("fix chord matches", fake(["ctrl", "win", "alt"], ""))
 
+    print("paraphrase chord")
+    para = set(m.lower() for m in config.get("paraphrase.modifiers", []))
+    check("paraphrase chord is bound", bool(para), f"{sorted(para)}")
+    check("paraphrase chord differs from talk", para != talk, f"{sorted(para)}")
+    check("paraphrase chord differs from fix", para != fix, f"{sorted(para)}")
+    # Not a superset and not a subset of either, so no partial press of one can
+    # ever look like another. Ctrl+Alt+Shift holds no Win key at all.
+    check("paraphrase chord cannot be confused with talk", not (talk <= para or para <= talk))
+    check("paraphrase chord cannot be confused with fix", not (fix <= para or para <= fix))
+    check("paraphrase reads the selection only",
+          config.get("paraphrase.scope") == "selection", config.get("paraphrase.scope"))
+
+    # The tap chords fire on release, once per press, and are abandoned when
+    # another key joins them, because Ctrl+Alt+Shift is the front half of a
+    # great many real shortcuts.
+    fired: list[str] = []
+    tapper = HotkeyListener(
+        config, lambda: None, lambda: None, lambda: None,
+        on_fix=lambda: fired.append("fix"),
+        on_paraphrase=lambda: fired.append("paraphrase"),
+    )
+    holding: set[str] = set()
+    foreign = [False]
+
+    tapper._chord_held = lambda mods, key: bool(mods) and set(mods) == holding
+    tapper._foreign_key_down = lambda _vks, _key: foreign[0]
+    tapper.POLL_S = 0
+
+    def press(*modifiers, other=False):
+        holding.clear()
+        holding.update(modifiers)
+        foreign[0] = other
+        tapper._poll(None)
+
+    press("ctrl", "win", "alt")
+    press("ctrl", "win", "alt")
+    check("holding the fix chord does not fire it", fired == [], str(fired))
+    press()
+    check("the fix chord fires on release", fired == ["fix"], str(fired))
+
+    press("ctrl", "alt", "shift")
+    press()
+    check("the paraphrase chord fires on release", fired == ["fix", "paraphrase"], str(fired))
+
+    press("ctrl", "win", "alt")
+    press()
+    press("ctrl", "alt", "shift")
+    press()
+    check("alternating chords both keep firing",
+          fired == ["fix", "paraphrase", "fix", "paraphrase"], str(fired))
+
+    # Ctrl+Alt+Shift+S in an editor: the modifiers land first, then the key.
+    before = list(fired)
+    press("ctrl", "alt", "shift")
+    press("ctrl", "alt", "shift", other=True)
+    press()
+    check("a chord that grew a fourth key does not fire", fired == before, str(fired[len(before):]))
+
+    # And the next clean press still works, so spoiling one is not sticky.
+    press("ctrl", "alt", "shift")
+    press()
+    check("a spoiled chord does not poison the next one",
+          fired == before + ["paraphrase"], str(fired))
+
     long_text = "This is a paragraph with an erorr in it.\n\n" * 200
     chunks = _split_paragraphs(long_text, 2200)
     check("long text is chunked", len(chunks) > 1, f"{len(long_text)} chars -> {len(chunks)}")

@@ -42,14 +42,34 @@ def collapse_repeats(text: str) -> str:
 CORRECTION_MARKERS = {"i mean", "i meant", "no wait", "wait no"}
 
 
+# Fillers that are also ordinary words doing ordinary work. "Um" is never
+# anything but noise, so it goes wherever it appears; "like" is a preposition
+# most of the time it is said, and cutting it turned "looks exactly like a key"
+# into "looks exactly a key" and "what time is the standup tomorrow, do you
+# know?" into "do?". These only come out where the speaker paused around them,
+# which is what a comma in the transcript records.
+HEDGES = frozenset({
+    "like", "you know", "i mean", "kind of", "sort of", "right", "so", "well",
+    "actually", "basically", "literally", "obviously", "i guess", "or something",
+})
+
+
 def strip_fillers(text: str, fillers: list[str], protect: set[str] | None = None) -> str:
     """Drop filler words when they stand alone as their own token."""
     protect = {p.lower() for p in (protect or set())}
     candidates = (f.strip() for f in fillers if f.strip() and f.strip().lower() not in protect)
     for filler in sorted(candidates, key=len, reverse=True):
         escaped = r"\s+".join(re.escape(part) for part in filler.split())
-        # Eat one adjacent comma so "well, um, anyway" does not leave ", ,".
-        pattern = re.compile(rf"(?<!\w)\s*,?\s*{escaped}\s*,?(?!\w)", re.IGNORECASE)
+        if filler.lower().rstrip("?.!") in HEDGES:
+            # A comma on one side or the other is the only evidence that this
+            # was a pause and not the word meaning what it usually means.
+            pattern = re.compile(
+                rf"(?:,\s*{escaped}(?!\w)\s*,?|(?<!\w){escaped}(?!\w)\s*,)",
+                re.IGNORECASE,
+            )
+        else:
+            # Eat one adjacent comma so "well, um, anyway" does not leave ", ,".
+            pattern = re.compile(rf"(?<!\w)\s*,?\s*{escaped}\s*,?(?!\w)", re.IGNORECASE)
         text = pattern.sub(" ", text)
     text = re.sub(r"\s*,\s*(?=[,.;:!?])", "", text)
     text = re.sub(r"^\s*[,;]\s*", "", text)
@@ -194,10 +214,22 @@ def soundex(word: str) -> str:
     return (head + "".join(digits) + "000")[:4]
 
 
+# Soundex keeps only the first letter and three consonant digits, so every
+# word sharing a beginning collides: "SecPlus" and "SecPlusMastery" are both
+# S241. Without a length check the single-word pass rewrote "SecPlus Mastery"
+# to "SecPlusMastery Mastery", snapping the first half to the whole name and
+# leaving the second half stranded. Two words that sound alike are not that
+# different in length; putting a split name back together is the joining
+# pass's job, not this one's.
+_LENGTH_RATIO = 0.7
+
+
 def _sounds_like(heard: str, wanted: str) -> bool:
     if heard.lower() == wanted.lower():
         return True
     if soundex(heard) != soundex(wanted):
+        return False
+    if min(len(heard), len(wanted)) / max(len(heard), len(wanted), 1) < _LENGTH_RATIO:
         return False
     from difflib import SequenceMatcher
 
@@ -223,6 +255,43 @@ def snap_to_vocabulary(text: str, vocabulary: list[str]) -> str:
     # Filenames, paths and identifiers are masked first, the same as for the
     # grammar rules, so Nectar.txt keeps its name.
     return _without_protected(text, lambda masked: _snap(masked, terms))
+
+
+# How many words the recogniser might split one name into.
+_MAX_SPLIT = 3
+
+
+def _join_split_term(
+    text: str, tokens: list[re.Match], start_index: int, terms: list[str]
+) -> tuple[int, int, str] | None:
+    """Put back together a one-word name the recogniser wrote as several.
+
+    "SecPlusMastery" comes back as "SecPlus Mastery", which the word-for-word
+    pass cannot see because it is comparing one heard word against one wanted
+    word. Every piece has to be capitalised for this to fire: that is the
+    recogniser's own signal that it thought it was writing a name, and it is
+    what keeps "the sec plus mastery of it" out of reach.
+    """
+    single = [t for t in terms if " " not in t and len(t) >= 6]
+    if not single:
+        return None
+    for size in range(_MAX_SPLIT, 1, -1):
+        window = tokens[start_index:start_index + size]
+        if len(window) != size:
+            continue
+        heard = [w.group(0) for w in window]
+        if not all(word[:1].isupper() for word in heard):
+            continue
+        span = text[window[0].start():window[-1].end()]
+        if any(c in span for c in ".,;:!?\n"):
+            continue
+        glued = "".join(heard)
+        for term in single:
+            if span == term:
+                continue  # already exactly right
+            if glued.lower() == term.lower() or _sounds_like(glued, term):
+                return window[0].start(), window[-1].end(), term
+    return None
 
 
 def _snap(text: str, terms: list[str]) -> str:
@@ -257,9 +326,102 @@ def _snap(text: str, terms: list[str]) -> str:
             edits.append((window[0].start(), window[-1].end(), term))
             taken = window[-1].end()
             break
+        else:
+            joined = _join_split_term(text, tokens, start_index, terms)
+            if joined:
+                edits.append(joined)
+                taken = joined[1]
     for start, end, term in reversed(edits):
         text = text[:start] + term + text[end:]
     return text
+
+
+# -- spoken paths and file names ---------------------------------------------
+
+# Extensions and domains common enough that "pipeline dot py" is never anybody
+# saying the word "dot". Anything outside this list is left as spoken, because
+# the cost of a wrong join is a mangled sentence and the cost of a miss is a
+# space.
+_EXTENSIONS = frozenset("""
+py js ts tsx jsx mjs cjs json md txt rst yml yaml toml ini cfg conf env csv tsv
+html htm css scss sql sh bash ps1 bat cmd exe dll log xml svg png jpg jpeg gif
+go rs rb java kt swift c cpp cc h hpp cs php lua vim zip tar gz
+com org net io dev ai co uk gov edu
+""".split())
+
+_SPOKEN_DOT = re.compile(
+    rf"(?<![\w.])([A-Za-z][\w-]*)\s+dot\s+({'|'.join(sorted(_EXTENSIONS))})(?![\w])",
+    re.IGNORECASE,
+)
+# The same shape with any short word in the extension slot, for the second
+# pass, where the stem has already been shown to be a path.
+_SPOKEN_DOT_LOOSE = re.compile(
+    r"(?<![\w.])([A-Za-z][\w./\\-]*[/\\_0-9][\w./\\-]*)\s+dot\s+([A-Za-z]{1,4})(?![\w])",
+    re.IGNORECASE,
+)
+_SPOKEN_SLASH = re.compile(
+    r"(?<![\w/])([A-Za-z][\w.-]*)((?:\s+slash\s+[A-Za-z][\w.-]*)+)(?![\w])",
+    re.IGNORECASE,
+)
+_SLASH_PART = re.compile(r"\s+slash\s+([A-Za-z][\w.-]*)", re.IGNORECASE)
+
+
+def _misheard_extension(word: str) -> str | None:
+    """The extension this short word was meant to be, if there is exactly one.
+
+    "Pipeline dot py" comes back as "pipeline dot pi" often enough to be worth
+    handling, and two letters is too little for the usual similarity ratio to
+    say anything. Soundex alone is enough here only because the caller has
+    already established that the stem is a path, and because an ambiguous
+    match is refused rather than guessed at.
+    """
+    low = word.lower()
+    if low in _EXTENSIONS:
+        return low
+    if len(low) > 3:
+        return None
+    # Same length as well as the same sound. Soundex drops vowels, so "pi"
+    # codes the same as both "py" and "php", and a two letter mishearing was
+    # two letters when it was said. It also keeps "in" away from "ini", which
+    # matters more, because "in" is a word people say.
+    code = soundex(low)
+    matches = {e for e in _EXTENSIONS if len(e) == len(low) and soundex(e) == code}
+    return matches.pop() if len(matches) == 1 else None
+
+
+def join_spoken_paths(text: str) -> str:
+    """Turn dictated file names and paths into the thing they name.
+
+    Someone reading a path out loud says "voxkey slash cleanup slash pipeline
+    dot py", and what belongs in the text box is voxkey/cleanup/pipeline.py.
+    The recogniser has no way to know that, so it writes the words.
+
+    Deliberately narrow at every step. A dot only joins when what follows is a
+    real extension or top level domain, and a run of slashes only joins when
+    there are two or more of them, or when the last piece already carries an
+    extension. "Twenty slash twenty vision" and "the dot on the i" are left
+    exactly as they were said.
+
+    The order matters. Exact extensions first, so "src slash app dot tsx" has
+    something for the slash rule to recognise; then the slashes; then the
+    near-miss extensions, by which point a stem containing a slash has proved
+    it is a path and "pi" can safely become "py".
+    """
+    text = _SPOKEN_DOT.sub(lambda m: f"{m.group(1)}.{m.group(2).lower()}", text)
+
+    def join(match: re.Match) -> str:
+        parts = [match.group(1)] + _SLASH_PART.findall(match.group(2))
+        if len(parts) < 3 and "." not in parts[-1]:
+            return match.group(0)
+        return "/".join(parts)
+
+    text = _SPOKEN_SLASH.sub(join, text)
+
+    def loose(match: re.Match) -> str:
+        extension = _misheard_extension(match.group(2))
+        return f"{match.group(1)}.{extension}" if extension else match.group(0)
+
+    return _SPOKEN_DOT_LOOSE.sub(loose, text)
 
 
 def run(text: str, cfg, level: str, protect_corrections: bool = False) -> str:
@@ -272,6 +434,11 @@ def run(text: str, cfg, level: str, protect_corrections: bool = False) -> str:
     text = tidy_spacing(text)
     if cfg.get("cleanup.snap_vocabulary", True):
         text = snap_to_vocabulary(text, cfg.get("asr.vocabulary", []))
+
+    if level in ("punctuation", "clean") and cfg.get("cleanup.spoken_paths", True):
+        # Before the voice commands, which would turn a spoken "dot" into a
+        # full stop and leave the file name split in half around it.
+        text = join_spoken_paths(text)
 
     if level in ("punctuation", "clean") and cfg.get("cleanup.voice_commands", True):
         text = apply_voice_commands(text, cfg.get("cleanup.voice_command_list", []))
@@ -324,7 +491,52 @@ _MISSPELLING = {
     "tommorow": "tomorrow", "calender": "calendar", "neccessary": "necessary",
     "recomend": "recommend", "succesful": "successful", "publically": "publicly",
     "maintainance": "maintenance", "existance": "existence", "occurence": "occurrence",
+    "recieved": "received", "seperated": "separated", "acheived": "achieved",
+    "occassion": "occasion", "arguement": "argument", "enviroment": "environment",
+    "goverment": "government", "independant": "independent", "noticable": "noticeable",
+    "priviledge": "privilege", "questionaire": "questionnaire", "refered": "referred",
+    "relevent": "relevant", "responsability": "responsibility", "sucess": "success",
+    "supress": "suppress", "truely": "truly", "wich": "which", "writting": "writing",
+    "begining": "beginning", "commited": "committed", "concious": "conscious",
+    "dissapoint": "disappoint", "embarass": "embarrass", "familar": "familiar",
+    "greatful": "grateful", "harrass": "harass", "immediatly": "immediately",
+    "knowlege": "knowledge", "libary": "library", "occuring": "occurring",
+    "particurly": "particularly", "posession": "possession", "prefered": "preferred",
+    "seige": "siege", "similiar": "similar", "speach": "speech", "tendancy": "tendency",
+    "threshhold": "threshold", "vaccum": "vacuum", "visable": "visible",
 }
+
+# Fixed phrases where the whole expression is wrong, not one word of it, and
+# where the correction never depends on context. The model gets most of these
+# and misses the idioms: "could care less" came back untouched every run,
+# because as a string of words there is nothing ungrammatical about it.
+# Deliberately absent: "try and" -> "try to", which would turn "try and try
+# again" into nonsense, and anything already covered by _OF_FOR_HAVE.
+_PHRASE: list[tuple[str, str]] = [
+    ("could care less", "couldn't care less"),
+    ("for all intensive purposes", "for all intents and purposes"),
+    ("case and point", "case in point"),
+    ("one in the same", "one and the same"),
+    ("nip it in the butt", "nip it in the bud"),
+    ("deep seeded", "deep seated"),
+    ("free reign", "free rein"),
+    ("peaked my interest", "piqued my interest"),
+    ("supposably", "supposedly"),
+    ("suppose to be", "supposed to be"),
+    ("use to be", "used to be"),
+    ("different then", "different than"),
+    ("more better", "better"),
+    ("most easiest", "easiest"),
+]
+
+# "who's" is a contraction of "who is"; before a noun it is nearly always the
+# possessive "whose" that was wanted. Restricted to a following noun phrase so
+# "who's coming" and "who's the lead" are untouched.
+_WHOSE = re.compile(
+    r"(?<!\w)who'?s(?=\s+(?:the\s+|a\s+|an\s+|this\s+|that\s+|my\s+|your\s+|his\s+|her\s+|"
+    r"their\s+|our\s+)?[a-z]+\s+(?:is|are|was|were|will|would|should|do|does|did)\b)",
+    re.IGNORECASE,
+)
 _OF_FOR_HAVE = re.compile(
     r"\b(could|should|would|must|might)\s+of\b", re.IGNORECASE
 )
@@ -387,7 +599,17 @@ def _fix_mechanical(text: str) -> str:
 
     known = sorted(set(_APOSTROPHE) | set(_MISSPELLING), key=len, reverse=True)
     text = re.sub(rf"(?<!\w)(?:{'|'.join(known)})(?!\w)", swap, text, flags=re.IGNORECASE)
-    return _OF_FOR_HAVE.sub(lambda m: f"{m.group(1)} have", text)
+    text = _OF_FOR_HAVE.sub(lambda m: f"{m.group(1)} have", text)
+
+    for wrong, right in _PHRASE:
+        spaced = r"\s+".join(re.escape(part) for part in wrong.split())
+        text = re.sub(
+            rf"(?<!\w){spaced}(?!\w)",
+            lambda m, r=right: _match_case(r, m.group(0)),
+            text,
+            flags=re.IGNORECASE,
+        )
+    return _WHOSE.sub(lambda m: _match_case("whose", m.group(0)), text)
 
 
 def fix_subject_pronouns(text: str) -> str:

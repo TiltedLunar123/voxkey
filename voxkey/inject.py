@@ -408,12 +408,17 @@ def _read_focus(automation: c_void_p) -> tuple[str, str]:
 _SENTINEL = "\x00voxkey-nothing-was-copied\x00"
 
 
-def grab_text(config) -> tuple[str | None, str, int]:
+def grab_text(config, scope: str | None = None) -> tuple[str | None, str, int]:
     """Copy the field (or the selection) out of the focused app.
 
     Returns (text, why_not, hwnd). A sentinel is parked on the clipboard first,
     so an app that ignores Ctrl+C, or one where Ctrl+A grabbed files rather than
     text, is detected instead of silently returning the previous clipboard.
+
+    scope overrides the setting the grammar fix uses. "selection" never presses
+    Ctrl+A, which is what the paraphrase chord wants: someone who selected one
+    sentence has said which sentence they meant, and selecting the whole
+    document on their behalf would reword everything around it.
     """
     hwnd = _foreground_hwnd()
     previous = get_clipboard_text()
@@ -421,7 +426,7 @@ def grab_text(config) -> tuple[str | None, str, int]:
     if not set_clipboard_text(_SENTINEL):
         return None, "the clipboard was locked", hwnd
 
-    if config.get("fix.scope", "all") == "all":
+    if (scope or config.get("fix.scope", "all")) == "all":
         _send(_key(VK_CONTROL), _key(VK_A), _key(VK_A, up=True), _key(VK_CONTROL, up=True))
         time.sleep(0.05)
     _send(_key(VK_CONTROL), _key(VK_C), _key(VK_C, up=True), _key(VK_CONTROL, up=True))
@@ -441,6 +446,8 @@ def grab_text(config) -> tuple[str | None, str, int]:
         set_clipboard_text("")
 
     if text is None:
+        if scope == "selection":
+            return None, "nothing is selected in that window", hwnd
         return None, "nothing was copied from that window", hwnd
     if not text.strip():
         return None, "that field is empty", hwnd
